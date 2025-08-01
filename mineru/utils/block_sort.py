@@ -179,12 +179,14 @@ def insert_lines_into_block(block_bbox, line_height, page_w, page_h):
 def model_init(model_name: str):
     from transformers import LayoutLMv3ForTokenClassification
     device_name = get_device()
-    bf_16_support = False
+    
+    # GPU优化点：检测GPU是否支持bf16，bf16在保持精度的同时减少显存
+    # 建议：Ampere架构(30系列)及以后的GPU支持bf16，可获得更好性能
     if device_name.startswith("cuda"):
         bf_16_support = torch.cuda.is_bf16_supported()
     elif device_name.startswith("mps"):
-        bf_16_support = True
-
+        bf_16_support = False
+        
     device = torch.device(device_name)
     if model_name == 'layoutreader':
         # 检测modelscope的缓存目录是否存在
@@ -200,6 +202,8 @@ def model_init(model_name: str):
             model = LayoutLMv3ForTokenClassification.from_pretrained(
                 'hantian/layoutreader'
             )
+        # GPU优化点：模型加载到GPU，并根据硬件支持情况使用bf16
+        # 建议：bf16相比fp16有更好的数值稳定性，适合transformer模型
         if bf_16_support:
             model.to(device).eval().bfloat16()
         else:

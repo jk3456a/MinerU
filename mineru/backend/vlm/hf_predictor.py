@@ -50,6 +50,8 @@ class HuggingfacePredictor(BasePredictor):
             max_new_tokens=max_new_tokens,
         )
 
+        # GPU优化点：使用device_map="auto"自动分配模型到多GPU
+        # 建议：对于大模型，可以使用量化(BitsAndBytes)减少显存占用
         kwargs = {"device_map": device_map, **kwargs}
 
         if device != "cuda":
@@ -58,13 +60,15 @@ class HuggingfacePredictor(BasePredictor):
         if load_in_8bit:
             kwargs["load_in_8bit"] = True
         elif load_in_4bit:
-            kwargs["load_in_4bit"] = True
-            kwargs["quantization_config"] = BitsAndBytesConfig(
+            # GPU优化点：4bit量化配置，大幅降低显存占用（可减少75%）
+            # 建议：对于consumer GPU，4bit量化是运行大模型的关键
+            bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
             )
+            kwargs["quantization_config"] = bnb_config
         else:
             kwargs["torch_dtype"] = torch_dtype
 
@@ -82,6 +86,8 @@ class HuggingfacePredictor(BasePredictor):
 
         vision_tower = self.model.get_model().vision_tower
         if device_map != "auto":
+            # GPU优化点：将视觉编码器移到指定设备
+            # 建议：视觉编码器通常较大，可以单独放在一个GPU上
             vision_tower.to(device=device_map, dtype=self.model.dtype)
 
         self.image_processor = vision_tower.image_processor
@@ -134,12 +140,16 @@ class HuggingfacePredictor(BasePredictor):
         image_obj = Image.open(BytesIO(image))
         image_tensor = process_images([image_obj], self.image_processor, self.model.config)
         image_tensor = image_tensor[0].unsqueeze(0)
+        # GPU优化点：图像张量移到GPU并转换数据类型
+        # 建议：使用pin_memory可以加速CPU到GPU的数据传输
         image_tensor = image_tensor.to(device=self.model.device, dtype=self.model.dtype)
         image_sizes = [[*image_obj.size]]
 
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(device=self.model.device)
 
+        # GPU优化点：使用inference_mode禁用梯度计算，节省显存
+        # 建议：推理时必须使用，可减少30-50%显存占用
         with torch.inference_mode():
             output_ids = self.model.generate(
                 input_ids,
