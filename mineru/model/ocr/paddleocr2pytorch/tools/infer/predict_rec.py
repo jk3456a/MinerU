@@ -9,6 +9,7 @@ from tqdm import tqdm
 from ...pytorchocr.base_ocr_v20 import BaseOCRV20
 from . import pytorchocr_utility as utility
 from ...pytorchocr.postprocess import build_post_process
+from mineru.utils.lockfree_async_transfer import LockFreeAsyncTransferManager, BatchAsyncProcessor
 
 
 class TextRecognizer(BaseOCRV20):
@@ -93,6 +94,19 @@ class TextRecognizer(BaseOCRV20):
         self.load_state_dict(weights)
         self.net.eval()
         self.net.to(self.device)
+        
+        # 初始化无锁异步传输管理器
+        self.use_async_transfer = getattr(args, 'use_async_transfer', True)
+        if self.use_async_transfer and torch.cuda.is_available():
+            self.async_manager = LockFreeAsyncTransferManager(
+                device=self.device,
+                max_inflight=getattr(args, 'async_max_inflight', 4),
+                enable_debug=getattr(args, 'async_debug', False)
+            )
+            self.batch_processor = BatchAsyncProcessor(self.async_manager)
+        else:
+            self.async_manager = None
+            self.batch_processor = None
 
     def resize_norm_img(self, img, max_wh_ratio):
         imgC, imgH, imgW = self.rec_image_shape
@@ -101,9 +115,9 @@ class TextRecognizer(BaseOCRV20):
             # return padding_im
             image_pil = Image.fromarray(np.uint8(img))
             if self.rec_algorithm == 'ViTSTR':
-                img = image_pil.resize([imgW, imgH], Image.BICUBIC)
+                img = image_pil.resize((imgW, imgH), Image.BICUBIC)
             else:
-                img = image_pil.resize([imgW, imgH], Image.ANTIALIAS)
+                img = image_pil.resize((imgW, imgH), Image.LANCZOS)
             img = np.array(img)
             norm_img = np.expand_dims(img, -1)
             norm_img = norm_img.transpose((2, 0, 1))
@@ -416,31 +430,112 @@ class TextRecognizer(BaseOCRV20):
 
                 else:
                     starttime = time.time()
-
-                    with torch.no_grad():
-                        inp = torch.from_numpy(norm_img_batch)
-                        inp = inp.to(self.device)
-                        prob_out = self.net(inp)
-
-                    if isinstance(prob_out, list):
-                        preds = [v.cpu().numpy() for v in prob_out]
+                    from mineru.utils.nvtx_utils import nvtx_range
+                    with nvtx_range(f"text_recognizer, img_num: {len(norm_img_batch)}"):
+                        with torch.no_grad():
+                            inp = torch.from_numpy(norm_img_batch)
+                            inp = inp.to(self.device)
+                            prob_out = self.net(inp)
+                    
+                    # 使用无锁异步传输
+                    if self.async_manager and self.async_manager.enabled:
+                        # 准备批次信息
+                        batch_info = {
+                            'indices': indices[beg_img_no:beg_img_no + len(norm_img_batch)],
+                            'postprocess_func': self.postprocess_op,
+                            'start_time': starttime,
+                            'beg_img_no': beg_img_no
+                        }
+                        
+                        # 启动异步传输
+                        if isinstance(prob_out, list):
+                            # 处理多个输出的情况
+                            transfer_ids = []
+                            for i, tensor in enumerate(prob_out):
+                                transfer_id = self.async_manager.async_transfer(tensor)
+                                if transfer_id is not None:
+                                    transfer_ids.append((i, transfer_id))
+                            batch_info['transfer_ids'] = transfer_ids
+                            batch_info['is_list'] = True
+                        else:
+                            # 单个输出
+                            transfer_id = self.batch_processor.add_batch(prob_out, batch_info)
+                            batch_info['is_list'] = False
+                        
+                        # 立即检查是否有已完成的批次
+                        if self.batch_processor:
+                            ready_batches = self.batch_processor.collect_ready_batches()
+                            for info, cpu_data in ready_batches:
+                                if info.get('is_list', False):
+                                    # 处理列表输出的情况
+                                    preds = self._collect_list_results(info)
+                                else:
+                                    preds = cpu_data
+                                
+                                rec_result = info['postprocess_func'](preds)
+                                for rno in range(len(rec_result)):
+                                    rec_res[info['indices'][rno]] = rec_result[rno]
+                                elapse += time.time() - info['start_time']
                     else:
-                        preds = prob_out.cpu().numpy()
-
-                rec_result = self.postprocess_op(preds)
-                for rno in range(len(rec_result)):
-                    rec_res[indices[beg_img_no + rno]] = rec_result[rno]
-                elapse += time.time() - starttime
+                        # 同步模式（fallback）
+                        print(f"fallback to sync mode")
+                        if isinstance(prob_out, list):
+                            preds = [v.cpu().numpy() for v in prob_out]
+                        else:
+                            preds = prob_out.cpu().numpy()
+                        rec_result = self.postprocess_op(preds)
+                        for rno in range(len(rec_result)):
+                            rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+                        elapse += time.time() - starttime
 
                 # 更新进度条，每次增加batch_size，但要注意最后一个batch可能不足batch_size
                 current_batch_size = min(batch_num, img_num - index * batch_num)
                 index += 1
                 pbar.update(current_batch_size)
+        
+        # 处理所有剩余的异步传输
+        if self.batch_processor:
+            remaining_batches = self.batch_processor.wait_all_batches()
+            for info, cpu_data in remaining_batches:
+                if info.get('is_list', False):
+                    preds = self._collect_list_results(info)
+                else:
+                    preds = cpu_data
+                
+                rec_result = info['postprocess_func'](preds)
+                for rno in range(len(rec_result)):
+                    rec_res[info['indices'][rno]] = rec_result[rno]
+                elapse += time.time() - info['start_time']
 
         # Fix NaN values in recognition results
         for i in range(len(rec_res)):
             text, score = rec_res[i]
             if isinstance(score, float) and math.isnan(score):
-                rec_res[i] = (text, 0.0)
+                rec_res[i] = [text, 0.0]
+        
+        # 输出性能统计（如果启用了调试模式）
+        if self.async_manager and self.async_manager.enable_debug:
+            stats = self.async_manager.get_stats()
+            print("\n[无锁异步传输统计]")
+            print(f"  - 总传输次数: {stats.get('total_transfers', 0)}")
+            print(f"  - 已完成传输: {stats.get('completed_transfers', 0)}")
+            print(f"  - Buffer命中率: {stats.get('buffer_hits', 0)}/{stats.get('buffer_hits', 0) + stats.get('buffer_misses', 0)}")
+            print(f"  - 待处理传输: {stats.get('pending_transfers', 0)}")
+            print(f"  - Buffer池状态: {stats.get('buffer_pool_sizes', {})}")
 
         return rec_res, elapse
+    
+    def _collect_list_results(self, batch_info: dict) -> list:
+        """收集列表形式的异步传输结果"""
+        # 此方法需要处理多个tensor的异步传输结果
+        # 暂时使用同步方式，后续可以优化
+        transfer_ids = batch_info.get('transfer_ids', [])
+        results = [None] * len(transfer_ids)
+        
+        # 等待所有传输完成并按顺序排列
+        all_completed = dict(self.async_manager.wait_all_transfers())
+        for idx, transfer_id in transfer_ids:
+            if transfer_id in all_completed:
+                results[idx] = all_completed[transfer_id]
+        
+        return results

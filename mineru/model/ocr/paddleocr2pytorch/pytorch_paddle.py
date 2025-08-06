@@ -147,9 +147,9 @@ class PytorchPaddleOCR(TextSystem):
                     if not isinstance(img, list):
                         img = preprocess_image(img)
                         img = [img]
-                    nvtx_start = torch.cuda.nvtx.range_push(f"text_recognizer, img_num: {len(img)}")
-                    rec_res, elapse = self.text_recognizer(img, tqdm_enable=tqdm_enable)
-                    torch.cuda.nvtx.range_pop()
+                    from mineru.utils.nvtx_utils import nvtx_range
+                    with nvtx_range(f"text_recognizer, img_num: {len(img)}"):
+                        rec_res, elapse = self.text_recognizer(img, tqdm_enable=tqdm_enable)
                     # logger.debug("rec_res num  : {}, elapsed : {}".format(len(rec_res), elapse))
                     ocr_res.append(rec_res)
                 return ocr_res

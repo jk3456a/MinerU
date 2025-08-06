@@ -5,6 +5,7 @@ PYTHON="/cache/lizhen/miniconda3/envs/mineru/bin/python"
 TIME_STAMP=$(date +%Y%m%d_%H%M%S)
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+export MINERU_NVTX_ENABLE=true
 
 # /usr/local/cuda-12.6/bin/nsys profile -w true \
 #     -t cuda,nvtx,osrt,cudnn,cublas \
@@ -18,7 +19,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
     -t cuda,nvtx,osrt,cudnn,cublas \
     -s cpu \
     -o $OUTPUT_DIR/mineru_${TIME_STAMP} \
-    $PYTHON examples/ocr_pdf_with_mineru.py
+    $PYTHON examples/ocr_pdf_with_mineru.py --use_async_transfer True
 
 # py-spy record -o $OUTPUT_DIR/python_profile_${TIME_STAMP}.svg \
 #     --duration 180 \

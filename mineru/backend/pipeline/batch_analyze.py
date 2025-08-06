@@ -175,9 +175,9 @@ class BatchAnalyze:
                     det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)  # 增加批处理大小
                     # logger.debug(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
                     #14.6%
-                    torch.cuda.nvtx.range_push(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
-                    batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
-                    torch.cuda.nvtx.range_pop()
+                    from mineru.utils.nvtx_utils import nvtx_range
+                    with nvtx_range(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}"):
+                        batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
                     # 处理批处理结果
                     for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
                         new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
@@ -312,9 +312,8 @@ class BatchAnalyze:
                         det_db_box_thresh=0.3,
                         lang=lang
                     )
-                    nvtx_start = torch.cuda.nvtx.range_push(f"OCR-rec batch: {len(img_crop_list)} images")
-                    ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
-                    torch.cuda.nvtx.range_pop()
+                    with nvtx_range(f"OCR-rec batch: {len(img_crop_list)} images"):
+                        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
 
                     # Verify we have matching counts
                     assert len(ocr_res_list) == len(
