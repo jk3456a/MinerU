@@ -16,7 +16,7 @@ from ....utils.ocr_utils import check_img, preprocess_image, sorted_boxes, merge
 from .tools.infer.predict_system import TextSystem
 from .tools.infer import pytorchocr_utility as utility
 import argparse
-
+import torch
 
 latin_lang = [
         'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',  # noqa: E126
@@ -147,7 +147,9 @@ class PytorchPaddleOCR(TextSystem):
                     if not isinstance(img, list):
                         img = preprocess_image(img)
                         img = [img]
+                    nvtx_start = torch.cuda.nvtx.range_push(f"text_recognizer, img_num: {len(img)}")
                     rec_res, elapse = self.text_recognizer(img, tqdm_enable=tqdm_enable)
+                    torch.cuda.nvtx.range_pop()
                     # logger.debug("rec_res num  : {}, elapsed : {}".format(len(rec_res), elapse))
                     ocr_res.append(rec_res)
                 return ocr_res

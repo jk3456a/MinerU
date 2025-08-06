@@ -191,6 +191,7 @@ def batch_image_analyze(
             logger.info(f'Could not determine GPU memory, using default batch_ratio: {batch_ratio}')
 
     batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable)
+    #76%
     results = batch_model(images_with_extra_info)
 
     clean_memory(get_device())
