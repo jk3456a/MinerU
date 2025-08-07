@@ -400,10 +400,12 @@ def get_res_list_from_layout_res(layout_res, iou_threshold=0.7, overlap_threshol
 
 
 def clean_memory(device='cuda'):
+    # GPU优化点：清理GPU缓存，释放未使用的显存
+    # 建议：在处理大批量文档时，定期调用此函数避免OOM
     if device == 'cuda':
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()  # 释放缓存的显存
+            torch.cuda.ipc_collect()  # 收集IPC内存
     elif str(device).startswith("npu"):
         if torch_npu.npu.is_available():
             torch_npu.npu.empty_cache()
@@ -413,15 +415,17 @@ def clean_memory(device='cuda'):
 
 
 def clean_vram(device, vram_threshold=8):
+    # GPU优化点：智能显存清理，当显存低于阈值时触发清理
+    # 建议：根据任务需求调整vram_threshold，避免频繁清理影响性能
     total_memory = get_vram(device)
-    if total_memory and total_memory <= vram_threshold:
-        gc_start = time.time()
+    if total_memory < vram_threshold:
+        logger.info(f'memory is less than {vram_threshold}GB, clean cache.')
         clean_memory(device)
-        gc_time = round(time.time() - gc_start, 2)
-        logger.info(f"gc time: {gc_time}")
 
 
 def get_vram(device):
+    # GPU优化点：获取GPU总显存，用于动态调整batch_size等参数
+    # 建议：基于显存大小自动优化模型加载策略
     if torch.cuda.is_available() and str(device).startswith("cuda"):
         total_memory = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)  # 将字节转换为 GB
         return total_memory

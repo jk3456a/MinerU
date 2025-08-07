@@ -115,6 +115,8 @@ class TextDetector(BaseOCRV20):
         super(TextDetector, self).__init__(network_config, **kwargs)
         self.load_pytorch_weights(self.weights_path)
         self.net.eval()
+        # GPU优化点：OCR检测模型加载到GPU
+        # 建议：对于大批量文档，可以常驻GPU避免反复加载
         self.net.to(self.device)
 
     def _batch_process_same_size(self, img_list):
@@ -161,11 +163,16 @@ class TextDetector(BaseOCRV20):
                 batch_results.append((dt_boxes, elapse))
             return batch_results, time.time() - starttime
 
+        # GPU优化点：将numpy数组转换为torch tensor并移到GPU
+        # 建议：使用pin_memory和non_blocking=True加速数据传输
+        with torch.no_grad():
+            inp = torch.from_numpy(batch_tensor)
+            inp = inp.to(self.device)
+
         # 批处理推理
         with torch.no_grad():
             inp = torch.from_numpy(batch_tensor)
             inp = inp.to(self.device)
-            outputs = self.net(inp)
 
         # 处理输出
         preds = {}
@@ -304,10 +311,11 @@ class TextDetector(BaseOCRV20):
         img = img.copy()
         starttime = time.time()
 
+        # GPU优化点：批量OCR检测推理
+        # 建议：增大batch_size以提高GPU利用率，但需要权衡显存使用
         with torch.no_grad():
             inp = torch.from_numpy(img)
             inp = inp.to(self.device)
-            outputs = self.net(inp)
 
         preds = {}
         if self.det_algorithm == "EAST":

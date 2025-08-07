@@ -14,6 +14,8 @@ class DocLayoutYOLOModel:
         conf: float = 0.1,
         iou: float = 0.45,
     ):
+        # GPU优化点：模型加载到GPU设备
+        # 建议：使用混合精度推理（half/fp16）可以减少显存占用并提升速度
         self.model = YOLOv10(weight).to(device)
         self.device = device
         self.imgsz = imgsz
@@ -27,6 +29,8 @@ class DocLayoutYOLOModel:
         if not hasattr(prediction, "boxes") or prediction.boxes is None:
             return layout_res
 
+        # GPU优化点：将GPU tensors转移到CPU
+        # 建议：批量处理时可以先收集所有GPU结果，再统一转移到CPU
         for xyxy, conf, cls in zip(
             prediction.boxes.xyxy.cpu(),
             prediction.boxes.conf.cpu(),
@@ -42,6 +46,8 @@ class DocLayoutYOLOModel:
         return layout_res
 
     def predict(self, image: Union[np.ndarray, Image.Image]) -> List[Dict]:
+        # GPU优化点：单张图片推理
+        # 建议：考虑使用TensorRT等推理加速框架进一步优化
         prediction = self.model.predict(
             image,
             imgsz=self.imgsz,
@@ -60,6 +66,8 @@ class DocLayoutYOLOModel:
         with tqdm(total=len(images), desc="Layout Predict") as pbar:
             for idx in range(0, len(images), batch_size):
                 batch = images[idx: idx + batch_size]
+                # GPU优化点：批量推理以提高GPU利用率
+                # 建议：根据GPU显存大小动态调整batch_size
                 predictions = self.model.predict(
                     batch,
                     imgsz=self.imgsz,

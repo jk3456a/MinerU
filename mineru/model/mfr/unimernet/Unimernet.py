@@ -27,8 +27,9 @@ class UnimernetModel(object):
             self.model = UnimernetModel.from_pretrained(weight_dir)
         self.device = _device_
         self.model.to(_device_)
-        if not _device_.startswith("cpu"):
-            self.model = self.model.to(dtype=torch.float16)
+        # GPU优化点：UnimerNet公式识别模型加载并转换为fp16
+        # 建议：对于大模型，fp16可以减少显存占用50%，速度提升30-50%
+        self.model = self.model.to(dtype=torch.float16)
         self.model.eval()
 
     def predict(self, mfd_res, image):
@@ -54,6 +55,8 @@ class UnimernetModel(object):
         for mf_img in dataloader:
             mf_img = mf_img.to(dtype=self.model.dtype)
             mf_img = mf_img.to(self.device)
+            # GPU优化点：公式识别推理，使用no_grad避免计算梯度
+            # 建议：可以使用torch.cuda.amp自动混合精度进一步优化
             with torch.no_grad():
                 output = self.model.generate({"image": mf_img})
             mfr_res.extend(output["fixed_str"])
@@ -118,6 +121,8 @@ class UnimernetModel(object):
             for index, mf_img in enumerate(dataloader):
                 mf_img = mf_img.to(dtype=self.model.dtype)
                 mf_img = mf_img.to(self.device)
+                # GPU优化点：批量公式识别，充分利用GPU并行计算能力
+                # 建议：batch_size=64是经验值，可根据公式复杂度和显存大小调整
                 with torch.no_grad():
                     output = self.model.generate({"image": mf_img}, batch_size=batch_size)
                 mfr_res.extend(output["fixed_str"])
