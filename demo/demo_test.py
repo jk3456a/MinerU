@@ -195,10 +195,10 @@ if __name__ == '__main__':
     t0 = time.time()
     # args
     __dir__ = os.path.dirname(os.path.abspath(__file__))
-    # pdf_files_dir = os.path.join(__dir__, "testinput")  # 使用新的testinput文件夹
-    # output_dir = os.path.join(__dir__, "testoutput")
-    pdf_files_dir = os.path.join(__dir__, "test_pdfs")
-    output_dir = os.path.join(__dir__, "test_output")
+    pdf_files_dir = os.path.join(__dir__, "testinput")  # 使用新的testinput文件夹
+    output_dir = os.path.join(__dir__, "testoutput")
+    # pdf_files_dir = os.path.join(__dir__, "test_pdfs")
+    # output_dir = os.path.join(__dir__, "test_output")
     pdf_suffixes = [".pdf"]
     image_suffixes = [".png", ".jpeg", ".jpg"]
 

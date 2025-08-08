@@ -4,7 +4,7 @@ PYTHON="/cache/lizhen/miniconda3/envs/mineru/bin/python"
 
 TIME_STAMP=$(date +%Y%m%d_%H%M%S)
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=1
 
 # /usr/local/cuda-12.6/bin/nsys profile -w true \
 #     -t cuda,nvtx,osrt,cudnn,cublas \
@@ -14,11 +14,8 @@ export CUDA_VISIBLE_DEVICES=2
 #     -x true \
 #     $PYTHON examples/ocr_pdf_with_mineru.py
 
-/usr/local/cuda-12.6/bin/nsys profile -w true \
-    -t cuda,nvtx,osrt,cudnn,cublas \
-    -s cpu \
-    -o $OUTPUT_DIR/mineru_${TIME_STAMP} \
-    $PYTHON examples/ocr_pdf_with_mineru.py > logs/one_pdf_${TIME_STAMP}.log 
+
+$PYTHON examples/ocr_pdf_with_mineru_baseline.py
 
 
 # py-spy record -o $OUTPUT_DIR/python_profile_${TIME_STAMP}.svg \

@@ -264,7 +264,7 @@ if __name__ == '__main__':
     """如果您由于网络问题无法下载模型，可以设置环境变量MINERU_MODEL_SOURCE为modelscope使用免代理仓库下载模型"""
     os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"
-    os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"
+    # os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"
     t1 = time.time()
     logger.info(f"Environment setup time: {t1 - t0:.2f}s")
     
