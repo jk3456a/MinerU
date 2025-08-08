@@ -25,6 +25,7 @@ PARSE_METHOD = "ocr"  # 解析方法
 OCR_ENABLE = True  # 是否启用OCR
 
 os.environ['MINERU_DONOT_CLEAN_MEM'] = 'true'
+os.environ['MINERU_ASYNC_DEBUG'] = 'false'
 # os.environ['MINERU_ASYNC_SYNC_INTERVAL'] = '4'
 
 PROJECT_DIR = "/cache/lizhen/repos/MinerU"
@@ -36,7 +37,7 @@ PDF_LIST_FILE = PROJECT_DIR + "/input/pdf_list.txt"  # 待处理PDF列表文件
 LOCAL_IMAGE_TMP_DIR = PROJECT_DIR + "/tmp/images"  # 临时图片目录
 
 # 测试任务路径配置
-TEST_PDF_DIR = "/cache/lizhen/repos/MinerU/input/sample_pdf_300/*pdf"  # 测试PDF目录
+TEST_PDF_DIR = "/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf"  # 测试PDF目录
 TEST_SAVE_DIR = "/cache/lizhen/repos/MinerU/output_test"  # 测试结果保存目录
 
 # 环境变量配置
@@ -50,7 +51,7 @@ DEVICE = "cuda"  # 运行设备
 # 测试模式配置
 TEST_MODE = True  # 是否开启测试模式（只测试1个PDF）
 TEST_SINGLE_PDF = True  # 单PDF测试模式
-TEST_NUM = 1
+TEST_NUM = 5
 
 
 def infer_one_pdf(pdf_file_path, lang=DEFAULT_LANG):
@@ -65,9 +66,7 @@ def infer_one_pdf(pdf_file_path, lang=DEFAULT_LANG):
     table_enable = TABLE_ENABLE
     pdf_name = os.path.basename(pdf_file_path)
     # 使用NVTX宏工具进行性能分析
-    # from mineru.utils.nvtx_utils import nvtx_range
-    
-    # with nvtx_range(f"pipeline_doc_analyze: {pdf_name}"):
+
     infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
         pipeline_doc_analyze(
             [new_pdf_bytes],

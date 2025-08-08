@@ -77,6 +77,9 @@ def doc_analyze(
     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
     可通过环境变量MINERU_MIN_BATCH_INFERENCE_SIZE设置，默认值为384。
     """
+    import time
+    t0 = time.time()
+    
     min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
 
     # 收集所有页面信息
@@ -85,6 +88,10 @@ def doc_analyze(
     all_image_lists = []
     all_pdf_docs = []
     ocr_enabled_list = []
+    
+    t1 = time.time()
+    logger.info(f"Starting PDF processing: {len(pdf_bytes_list)} PDFs")
+    
     for pdf_idx, pdf_bytes in enumerate(pdf_bytes_list):
         # 确定OCR设置
         _ocr_enable = False
@@ -107,19 +114,34 @@ def doc_analyze(
                 pdf_idx, page_idx,
                 img_dict['img_pil'], _ocr_enable, _lang,
             ))
+    
+    t2 = time.time()
+    total_pages = len(all_pages_info)
+    logger.info(f"PDF processing completed: {t2 - t1:.2f}s")
+    logger.info(f"Total pages collected: {total_pages}")
+    logger.info(f"OCR enabled for {sum(ocr_enabled_list)}/{len(ocr_enabled_list)} PDFs")
 
     # 准备批处理
+    t3 = time.time()
     images_with_extra_info = [(info[2], info[3], info[4]) for info in all_pages_info]
     batch_size = min_batch_inference_size
     batch_images = [
         images_with_extra_info[i:i + batch_size]
         for i in range(0, len(images_with_extra_info), batch_size)
     ]
+    
+    t4 = time.time()
+    logger.info(f"Batch preparation completed: {t4 - t3:.2f}s")
+    logger.info(f"Created {len(batch_images)} batches with batch_size={batch_size}")
 
     # 执行批处理
+    t5 = time.time()
     results = []
     processed_images_count = 0
+    batch_times = []
+    
     for index, batch_image in enumerate(batch_images):
+        batch_start = time.time()
         processed_images_count += len(batch_image)
         logger.info(
             f'Batch {index + 1}/{len(batch_images)}: '
@@ -127,8 +149,20 @@ def doc_analyze(
         )
         batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
         results.extend(batch_results)
+        batch_end = time.time()
+        batch_time = batch_end - batch_start
+        batch_times.append(batch_time)
+        logger.info(f'Batch {index + 1} completed in {batch_time:.2f}s')
+    
+    t6 = time.time()
+    total_inference_time = t6 - t5
+    avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+    logger.info(f"Batch inference completed: {total_inference_time:.2f}s")
+    logger.info(f"Average batch time: {avg_batch_time:.2f}s")
+    logger.info(f"Inference throughput: {total_pages/total_inference_time:.1f} pages/s")
 
     # 构建返回结果
+    t7 = time.time()
     infer_results = []
 
     for _ in range(len(pdf_bytes_list)):
@@ -142,6 +176,25 @@ def doc_analyze(
         page_dict = {'layout_dets': result, 'page_info': page_info_dict}
 
         infer_results[pdf_idx].append(page_dict)
+    
+    t8 = time.time()
+    logger.info(f"Result construction completed: {t8 - t7:.2f}s")
+    
+    total_time = t8 - t0
+    logger.info(f"Total doc_analyze time: {total_time:.2f}s")
+    logger.info(f"Overall throughput: {total_pages/total_time:.1f} pages/s")
+    
+    # 时间分解
+    pdf_processing_time = t2 - t1
+    batch_prep_time = t4 - t3
+    inference_time = t6 - t5
+    result_construction_time = t8 - t7
+    
+    logger.info(f"Time breakdown:")
+    logger.info(f"  PDF processing: {pdf_processing_time:.2f}s ({pdf_processing_time/total_time*100:.1f}%)")
+    logger.info(f"  Batch preparation: {batch_prep_time:.2f}s ({batch_prep_time/total_time*100:.1f}%)")
+    logger.info(f"  Inference: {inference_time:.2f}s ({inference_time/total_time*100:.1f}%)")
+    logger.info(f"  Result construction: {result_construction_time:.2f}s ({result_construction_time/total_time*100:.1f}%)")
 
     return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list
 
