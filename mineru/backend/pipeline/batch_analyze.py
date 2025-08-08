@@ -10,11 +10,12 @@ from ...utils.config_reader import get_formula_enable, get_table_enable
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res
 from ...utils.ocr_utils import get_adjusted_mfdetrec_res, get_ocr_result_list, OcrConfidence
 
-YOLO_LAYOUT_BASE_BATCH_SIZE = 8
-MFD_BASE_BATCH_SIZE = 1
-MFR_BASE_BATCH_SIZE = 16
-OCR_DET_BASE_BATCH_SIZE = 16
+import os
 
+YOLO_LAYOUT_BASE_BATCH_SIZE = int(os.environ.get('MINERU_LAYOUT_BATCH_SIZE', 8))
+MFD_BASE_BATCH_SIZE = int(os.environ.get('MINERU_MFD_BATCH_SIZE', 1))
+MFR_BASE_BATCH_SIZE = int(os.environ.get('MINERU_MFR_BATCH_SIZE', 16))
+OCR_DET_BASE_BATCH_SIZE = int(os.environ.get('MINERU_OCR_DET_BATCH_SIZE', 16))
 
 class BatchAnalyze:
     def __init__(self, model_manager, batch_ratio: int, formula_enable, table_enable, enable_ocr_det_batch: bool = True):
