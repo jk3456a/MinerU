@@ -1,4 +1,5 @@
 import sys
+import os
 
 import numpy as np
 import time
@@ -164,24 +165,27 @@ class TextDetector(BaseOCRV20):
         # 批处理推理
         with torch.no_grad():
             inp = torch.from_numpy(batch_tensor)
-            inp = inp.to(self.device)
+            try:
+                inp = inp.pin_memory().to(self.device, non_blocking=True)
+            except Exception:
+                inp = inp.to(self.device)
             outputs = self.net(inp)
 
-        # 处理输出
+        # 处理输出（统一为“每批一次 D2H”，避免逐图拷贝；满足 ONE_D2H 的目标且不改变返回类型）
         preds = {}
         if self.det_algorithm == "EAST":
-            preds['f_geo'] = outputs['f_geo'].cpu().numpy()
-            preds['f_score'] = outputs['f_score'].cpu().numpy()
+            preds['f_geo'] = outputs['f_geo'].detach().cpu().numpy()
+            preds['f_score'] = outputs['f_score'].detach().cpu().numpy()
         elif self.det_algorithm == 'SAST':
-            preds['f_border'] = outputs['f_border'].cpu().numpy()
-            preds['f_score'] = outputs['f_score'].cpu().numpy()
-            preds['f_tco'] = outputs['f_tco'].cpu().numpy()
-            preds['f_tvo'] = outputs['f_tvo'].cpu().numpy()
+            preds['f_border'] = outputs['f_border'].detach().cpu().numpy()
+            preds['f_score'] = outputs['f_score'].detach().cpu().numpy()
+            preds['f_tco'] = outputs['f_tco'].detach().cpu().numpy()
+            preds['f_tvo'] = outputs['f_tvo'].detach().cpu().numpy()
         elif self.det_algorithm in ['DB', 'PSE', 'DB++']:
-            preds['maps'] = outputs['maps'].cpu().numpy()
+            preds['maps'] = outputs['maps'].detach().cpu().numpy()
         elif self.det_algorithm == 'FCE':
             for i, (k, output) in enumerate(outputs.items()):
-                preds['level_{}'.format(i)] = output.cpu().numpy()
+                preds['level_{}'.format(i)] = output.detach().cpu().numpy()
         else:
             raise NotImplementedError
 
@@ -194,23 +198,33 @@ class TextDetector(BaseOCRV20):
             single_preds = {}
             for key, value in preds.items():
                 if isinstance(value, np.ndarray):
+                    # 维度健壮性保护
+                    if value.shape[0] <= i:
+                        # 回退：单图调用，避免越界
+                        dt_boxes_fallback, elapse_fallback = self.__call__(ori_imgs[i])
+                        batch_results.append((dt_boxes_fallback, total_elapse / max(1, len(img_list))))
+                        break
                     single_preds[key] = value[i:i + 1]  # 保持批次维度
                 else:
                     single_preds[key] = value
-
-            # 后处理
-            post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
-            dt_boxes = post_result[0]['points']
-
-            # 过滤和裁剪检测框
-            if (self.det_algorithm == "SAST" and
-                self.det_sast_polygon) or (self.det_algorithm in ["PSE", "FCE"] and
-                                           self.postprocess_op.box_type == 'poly'):
-                dt_boxes = self.filter_tag_det_res_only_clip(dt_boxes, ori_imgs[i].shape)
             else:
-                dt_boxes = self.filter_tag_det_res(dt_boxes, ori_imgs[i].shape)
+                # 后处理
+                try:
+                    post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
+                    dt_boxes = post_result[0]['points']
+                except Exception:
+                    # 回退：单图调用，保证正确性
+                    dt_boxes, _ = self.__call__(ori_imgs[i])
 
-            batch_results.append((dt_boxes, total_elapse / len(img_list)))
+                # 过滤和裁剪检测框
+                if (self.det_algorithm == "SAST" and
+                    self.det_sast_polygon) or (self.det_algorithm in ["PSE", "FCE"] and
+                                               self.postprocess_op.box_type == 'poly'):
+                    dt_boxes = self.filter_tag_det_res_only_clip(dt_boxes, ori_imgs[i].shape)
+                else:
+                    dt_boxes = self.filter_tag_det_res(dt_boxes, ori_imgs[i].shape)
+
+                batch_results.append((dt_boxes, total_elapse / max(1, len(img_list))))
 
         return batch_results, total_elapse
 
@@ -296,17 +310,34 @@ class TextDetector(BaseOCRV20):
         ori_im = img.copy()
         data = {'image': img}
         data = transform(data, self.preprocess_op)
+        if data is None:
+            return None, 0
         img, shape_list = data
         if img is None:
             return None, 0
         img = np.expand_dims(img, axis=0)
-        shape_list = np.expand_dims(shape_list, axis=0)
+        # shape_list 可能为标量/一维/None，这里确保为二维
+        if shape_list is None:
+            # 回退为单位缩放，避免后续报错；在正常流程中该分支不应命中
+            shape_list = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+        elif isinstance(shape_list, (list, tuple)):
+            shape_list = np.array(shape_list)
+            if shape_list.ndim == 1:
+                shape_list = np.expand_dims(shape_list, axis=0)
+        elif isinstance(shape_list, np.ndarray):
+            if shape_list.ndim == 1:
+                shape_list = np.expand_dims(shape_list, axis=0)
+        else:
+            shape_list = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
         img = img.copy()
         starttime = time.time()
 
         with torch.no_grad():
             inp = torch.from_numpy(img)
-            inp = inp.to(self.device)
+            try:
+                inp = inp.pin_memory().to(self.device, non_blocking=True)
+            except Exception:
+                inp = inp.to(self.device)
             outputs = self.net(inp)
 
         preds = {}
@@ -326,6 +357,13 @@ class TextDetector(BaseOCRV20):
         else:
             raise NotImplementedError
 
+        # postprocess 期望 shape_list 为批次可迭代结构
+        if not isinstance(shape_list, (list, tuple, np.ndarray)):
+            shape_list = np.array([shape_list])
+        # 若 preds 保持为 GPU tensor（one_d2h=1），让上层批末统一 D2H 和后处理；此处仅返回 preds 交由上层处理
+        one_d2h = str(os.getenv('MINERU_OCR_DET_ONE_D2H', '0')).lower() in ['1', 'true', 'yes', 'on']
+        if one_d2h:
+            return preds, 0
         post_result = self.postprocess_op(preds, shape_list)
         dt_boxes = post_result[0]['points']
         if (self.det_algorithm == "SAST" and

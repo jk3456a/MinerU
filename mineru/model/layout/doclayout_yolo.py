@@ -27,10 +27,13 @@ class DocLayoutYOLOModel:
         if not hasattr(prediction, "boxes") or prediction.boxes is None:
             return layout_res
 
+        # 避免对同一结果多次 .cpu() 触发多个 D2H，将 boxes 一次性移到 CPU
+        boxes_cpu = prediction.boxes.to('cpu') if hasattr(prediction.boxes, 'to') else prediction.boxes
+
         for xyxy, conf, cls in zip(
-            prediction.boxes.xyxy.cpu(),
-            prediction.boxes.conf.cpu(),
-            prediction.boxes.cls.cpu(),
+            boxes_cpu.xyxy,
+            boxes_cpu.conf,
+            boxes_cpu.cls,
         ):
             coords = list(map(int, xyxy.tolist()))
             xmin, ymin, xmax, ymax = coords

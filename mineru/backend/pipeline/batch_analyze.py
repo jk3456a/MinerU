@@ -126,12 +126,13 @@ class BatchAnalyze:
                 lang = crop_info[5]
                 lang_groups[lang].append(crop_info)
 
-            # 对每种语言按分辨率分组并批处理
+            # 控制是否将同一语言的分辨率桶合并为一个统一尺寸的单桶（可减少批次数和拷贝次数）
+            merge_buckets = os.getenv('MINERU_OCR_DET_MERGE_BUCKETS', '0').lower() in ['1', 'true', 'yes', 'on']
+
+            # 对每种语言按策略批处理 OCR-det
             for lang, lang_crop_list in lang_groups.items():
                 if not lang_crop_list:
                     continue
-
-                # logger.info(f"Processing OCR detection for language {lang} with {len(lang_crop_list)} images")
 
                 # 获取OCR模型
                 ocr_model = atom_model_manager.get_atom_model(
@@ -140,82 +141,91 @@ class BatchAnalyze:
                     lang=lang
                 )
 
-                # 按分辨率分组并同时完成padding
-                resolution_groups = defaultdict(list)
-                for crop_info in lang_crop_list:
-                    cropped_img = crop_info[0]
-                    h, w = cropped_img.shape[:2]
-                    # 使用更大的分组容差，减少分组数量
-                    # 将尺寸标准化到32的倍数
-                    normalized_h = ((h + 32) // 32) * 32  # 向上取整到32的倍数
-                    normalized_w = ((w + 32) // 32) * 32
-                    group_key = (normalized_h, normalized_w)
-                    resolution_groups[group_key].append(crop_info)
+                if merge_buckets:
+                    # 合并所有分辨率为一个统一目标尺寸
+                    max_h_all = 0
+                    max_w_all = 0
+                    for crop_info in lang_crop_list:
+                        h, w = crop_info[0].shape[:2]
+                        if h > max_h_all:
+                            max_h_all = h
+                        if w > max_w_all:
+                            max_w_all = w
+                    target_h = ((max_h_all + 32 - 1) // 32) * 32
+                    target_w = ((max_w_all + 32 - 1) // 32) * 32
 
-                # 对每个分辨率组进行批处理
-                for group_key, group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
-
-                    # 计算目标尺寸（组内最大尺寸，向上取整到32的倍数）
-                    max_h = max(crop_info[0].shape[0] for crop_info in group_crops)
-                    max_w = max(crop_info[0].shape[1] for crop_info in group_crops)
-                    target_h = ((max_h + 32 - 1) // 32) * 32
-                    target_w = ((max_w + 32 - 1) // 32) * 32
-
-                    # 对所有图像进行padding到统一尺寸
                     batch_images = []
-                    for crop_info in group_crops:
+                    for crop_info in lang_crop_list:
                         img = crop_info[0]
                         h, w = img.shape[:2]
-                        # 创建目标尺寸的白色背景
                         padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
-                        # 将原图像粘贴到左上角
                         padded_img[:h, :w] = img
                         batch_images.append(padded_img)
 
-                    # 批处理检测
-                    det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)  # 增加批处理大小
-                    # logger.debug(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
-                    #14.6%
-                    torch.cuda.nvtx.range_push(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
+                    det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
+                    torch.cuda.nvtx.range_push(f"OCR-det batch(merged {lang}): {det_batch_size} images, target size: {target_h}x{target_w}")
                     batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
                     torch.cuda.nvtx.range_pop()
-                    # 处理批处理结果
-                    for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
-                        new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
 
+                    for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(lang_crop_list, batch_results)):
+                        new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
                         if dt_boxes is not None and len(dt_boxes) > 0:
-                            # 直接应用原始OCR流程中的关键处理步骤
                             from mineru.utils.ocr_utils import (
                                 merge_det_boxes, update_det_boxes, sorted_boxes
                             )
-
-                            # 1. 排序检测框
-                            if len(dt_boxes) > 0:
-                                dt_boxes_sorted = sorted_boxes(dt_boxes)
-                            else:
-                                dt_boxes_sorted = []
-
-                            # 2. 合并相邻检测框
-                            if dt_boxes_sorted:
-                                dt_boxes_merged = merge_det_boxes(dt_boxes_sorted)
-                            else:
-                                dt_boxes_merged = []
-
-                            # 3. 根据公式位置更新检测框（关键步骤！）
-                            if dt_boxes_merged and adjusted_mfdetrec_res:
-                                dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
-                            else:
-                                dt_boxes_final = dt_boxes_merged
-
-                            # 构造OCR结果格式
+                            dt_boxes_sorted = sorted_boxes(dt_boxes) if len(dt_boxes) > 0 else []
+                            dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
+                            dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res) if (dt_boxes_merged and adjusted_mfdetrec_res) else dt_boxes_merged
                             ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
-
                             if ocr_res:
                                 ocr_result_list = get_ocr_result_list(
                                     ocr_res, useful_list, ocr_res_list_dict['ocr_enable'], new_image, _lang
                                 )
-
                                 ocr_res_list_dict['layout_res'].extend(ocr_result_list)
+                else:
+                    # 原有：按分辨率分桶
+                    resolution_groups = defaultdict(list)
+                    for crop_info in lang_crop_list:
+                        cropped_img = crop_info[0]
+                        h, w = cropped_img.shape[:2]
+                        normalized_h = ((h + 32) // 32) * 32
+                        normalized_w = ((w + 32) // 32) * 32
+                        group_key = (normalized_h, normalized_w)
+                        resolution_groups[group_key].append(crop_info)
+
+                    for group_key, group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
+                        max_h = max(crop_info[0].shape[0] for crop_info in group_crops)
+                        max_w = max(crop_info[0].shape[1] for crop_info in group_crops)
+                        target_h = ((max_h + 32 - 1) // 32) * 32
+                        target_w = ((max_w + 32 - 1) // 32) * 32
+
+                        batch_images = []
+                        for crop_info in group_crops:
+                            img = crop_info[0]
+                            h, w = img.shape[:2]
+                            padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
+                            padded_img[:h, :w] = img
+                            batch_images.append(padded_img)
+
+                        det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
+                        torch.cuda.nvtx.range_push(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
+                        batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
+                        torch.cuda.nvtx.range_pop()
+                        for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
+                            new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
+                            if dt_boxes is not None and len(dt_boxes) > 0:
+                                from mineru.utils.ocr_utils import (
+                                    merge_det_boxes, update_det_boxes, sorted_boxes
+                                )
+                                dt_boxes_sorted = sorted_boxes(dt_boxes) if len(dt_boxes) > 0 else []
+                                dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
+                                dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res) if (dt_boxes_merged and adjusted_mfdetrec_res) else dt_boxes_merged
+                                ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
+                                if ocr_res:
+                                    ocr_result_list = get_ocr_result_list(
+                                        ocr_res, useful_list, ocr_res_list_dict['ocr_enable'], new_image, _lang
+                                    )
+                                    ocr_res_list_dict['layout_res'].extend(ocr_result_list)
         else:
             # 原始单张处理模式
             for ocr_res_list_dict in tqdm(ocr_res_list_all_page, desc="OCR-det Predict"):

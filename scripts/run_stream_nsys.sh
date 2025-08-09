@@ -14,12 +14,10 @@ export CUDA_VISIBLE_DEVICES=2
 #     -x true \
 #     $PYTHON examples/ocr_pdf_with_mineru.py
 
-export MINERU_STREAM_QUEUE_SIZE=8192
-export MINERU_BATCH_FLUSH_MS=1200
-export MINERU_MIN_BATCH_INFERENCE_SIZE=1024
+export MINERU_MIN_BATCH_INFERENCE_SIZE=768
+export MINERU_VIRTUAL_VRAM_SIZE=24
 
 $PYTHON  demo/demo_stream.py
-
 
 # py-spy record -o $OUTPUT_DIR/python_profile_${TIME_STAMP}.svg \
 #     --duration 180 \

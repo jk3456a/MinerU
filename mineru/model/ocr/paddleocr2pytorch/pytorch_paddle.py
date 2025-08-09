@@ -88,7 +88,12 @@ class PytorchPaddleOCR(TextSystem):
         kwargs['det_model_path'] = det_model_path
         kwargs['rec_model_path'] = rec_model_path
         kwargs['rec_char_dict_path'] = os.path.join(root_dir, 'pytorchocr', 'utils', 'resources', 'dict', dict_file)
-        kwargs['rec_batch_num'] = 16
+        # 允许通过环境变量调整识别批大小，减少小批多拷贝次数
+        try:
+            _rec_bs = int(os.environ.get('MINERU_OCR_REC_BATCH_SIZE', '16'))
+        except Exception:
+            _rec_bs = 16
+        kwargs['rec_batch_num'] = _rec_bs
 
         kwargs['device'] = device
 

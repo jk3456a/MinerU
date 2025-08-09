@@ -188,7 +188,11 @@ def _process_pipeline(
         model_json = copy.deepcopy(model_list)
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        # 允许通过环境变量跳过临时图片写入以减少IO与中间数据
+        from mineru.data.data_reader_writer import DummyDataWriter
+        skip_tmp_images = os.getenv('MINERU_SKIP_TMP_IMAGES', '').lower() in ['1', 'true', 'yes', 'on']
+        image_writer = DummyDataWriter() if skip_tmp_images else FileBasedDataWriter(local_image_dir)
+        md_writer = FileBasedDataWriter(local_md_dir)
 
         images_list = all_image_lists[idx]
         pdf_doc = all_pdf_docs[idx]

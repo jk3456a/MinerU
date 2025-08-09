@@ -29,7 +29,7 @@ os.makedirs("logs", exist_ok=True)
 run_id = str(uuid.uuid4())[:8]  # 取前8位作为运行ID
 
 logger.add(
-    "logs/baseline_30.log",  # 日志文件
+    "logs/baseline_D2H.log",  # 日志文件
     format="\n{time:YYYY-MM-DD HH:mm:ss} | {level} | [{run_id}] {message}",
     level="INFO",
     rotation="10 MB",  # 日志文件大小超过10MB时轮转
@@ -99,7 +99,7 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
 
     model_json = copy.deepcopy(model_list)
 
-    local_image_dir = f"/cache/lizhen/repos/MinerU/demo/output_baseline/{pdf_name}"
+    local_image_dir = f"/cache/lizhen/repos/MinerU/demo/output_baseline_D2H/{pdf_name}"
     if not os.path.exists(local_image_dir):
         os.system(f"mkdir -p {local_image_dir}")
     image_writer = FileBasedDataWriter(local_image_dir)
@@ -168,8 +168,8 @@ def get_all_access_pdf_paths():
 
 def run_test_task():
     t0 = time.time()
-    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/testinput/*pdf")  # 使用新的testinput文件夹
-    save_dir = "/cache/lizhen/repos/MinerU/demo/output_baseline"
+    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")  # 使用新的testinput文件夹
+    save_dir = "/cache/lizhen/repos/MinerU/demo/output_baseline_D2H"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"
     
@@ -222,8 +222,8 @@ def main():
 
 if __name__ == "__main__":
     t0 = time.time()
-    os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
-    os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"
+    # os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
+    # os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"
     # os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "512"
     
     logger.info("Starting baseline OCR processing...")

@@ -1,4 +1,5 @@
 from PIL import Image
+import os
 import cv2
 import numpy as np
 import math
@@ -100,10 +101,18 @@ class TextRecognizer(BaseOCRV20):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             # return padding_im
             image_pil = Image.fromarray(np.uint8(img))
+            # 兼容 Pillow 新旧版本的重采样枚举，保持语义不变
+            resampling = getattr(Image, 'Resampling', None)
             if self.rec_algorithm == 'ViTSTR':
-                img = image_pil.resize([imgW, imgH], Image.BICUBIC)
+                if resampling is not None:
+                    img = image_pil.resize([imgW, imgH], resampling.BICUBIC)
+                else:
+                    img = image_pil.resize([imgW, imgH], getattr(Image, 'BICUBIC', 3))
             else:
-                img = image_pil.resize([imgW, imgH], Image.ANTIALIAS)
+                if resampling is not None:
+                    img = image_pil.resize([imgW, imgH], resampling.LANCZOS)
+                else:
+                    img = image_pil.resize([imgW, imgH], getattr(Image, 'LANCZOS', 1))
             img = np.array(img)
             norm_img = np.expand_dims(img, -1)
             norm_img = norm_img.transpose((2, 0, 1))
@@ -397,7 +406,10 @@ class TextRecognizer(BaseOCRV20):
 
                     with torch.no_grad():
                         inp = torch.from_numpy(norm_img_batch)
-                        inp = inp.to(self.device)
+                        try:
+                            inp = inp.pin_memory().to(self.device, non_blocking=True)
+                        except Exception:
+                            inp = inp.to(self.device)
                         preds = self.net(inp)
 
                 elif self.rec_algorithm == "CAN":
@@ -407,7 +419,10 @@ class TextRecognizer(BaseOCRV20):
                     inputs = [norm_img_batch, norm_img_mask_batch, word_label_list]
 
                     inp = [torch.from_numpy(e_i) for e_i in inputs]
-                    inp = [e_i.to(self.device) for e_i in inp]
+                    try:
+                        inp = [e_i.pin_memory().to(self.device, non_blocking=True) for e_i in inp]
+                    except Exception:
+                        inp = [e_i.to(self.device) for e_i in inp]
                     with torch.no_grad():
                         outputs = self.net(inp)
                         outputs = [v.cpu().numpy() for k, v in enumerate(outputs)]
@@ -415,21 +430,49 @@ class TextRecognizer(BaseOCRV20):
                     preds = outputs
 
                 else:
-                    starttime = time.time()
+                    # 通常路径：一次性 D2H（可选）。当 MINERU_OCR_REC_ONE_D2H=1 且输出为 Tensor 时，累积到最后统一 cpu()
+                    starttime_total = time.time()
+                    one_d2h = str(os.getenv('MINERU_OCR_REC_ONE_D2H', '0')).lower() in ['1', 'true', 'yes', 'on']
+                    supported_single = True
+                    if 'gpu_pred_acc' not in locals():
+                        gpu_pred_acc = []
+                        acc_count = 0
 
                     with torch.no_grad():
                         inp = torch.from_numpy(norm_img_batch)
-                        inp = inp.to(self.device)
+                        try:
+                            inp = inp.pin_memory().to(self.device, non_blocking=True)
+                        except Exception:
+                            inp = inp.to(self.device)
                         prob_out = self.net(inp)
 
-                    if isinstance(prob_out, list):
-                        preds = [v.cpu().numpy() for v in prob_out]
+                    if one_d2h and isinstance(prob_out, torch.Tensor):
+                        gpu_pred_acc.append(prob_out)
+                        acc_count += prob_out.shape[0]
+                        # 先不做 D2H，延后到循环外一次完成
+                        preds = None
                     else:
-                        preds = prob_out.cpu().numpy()
+                        # 回退到原有逐批 D2H 路径
+                        supported_single = False
+                        if isinstance(prob_out, list):
+                            preds = [v.cpu().numpy() for v in prob_out]
+                        else:
+                            preds = prob_out.cpu().numpy()
 
-                rec_result = self.postprocess_op(preds)
-                for rno in range(len(rec_result)):
-                    rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+                    if preds is not None:
+                        rec_result = self.postprocess_op(preds)
+                        for rno in range(len(rec_result)):
+                            rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+                    elapse += time.time() - starttime_total
+
+            # 循环结束后，如开启单次 D2H 且收集到了 GPU 预测，统一一次 cpu() 并解码
+            if 'gpu_pred_acc' in locals() and one_d2h and len(gpu_pred_acc) > 0 and supported_single:
+                starttime = time.time()
+                preds_all = torch.cat(gpu_pred_acc, dim=0).to('cpu', non_blocking=False).numpy()
+                rec_result_all = self.postprocess_op(preds_all)
+                # rec_result_all 与 indices 排序一致，直接映射回原始顺序
+                for rno in range(len(rec_result_all)):
+                    rec_res[indices[rno]] = rec_result_all[rno]
                 elapse += time.time() - starttime
 
                 # 更新进度条，每次增加batch_size，但要注意最后一个batch可能不足batch_size
@@ -441,6 +484,6 @@ class TextRecognizer(BaseOCRV20):
         for i in range(len(rec_res)):
             text, score = rec_res[i]
             if isinstance(score, float) and math.isnan(score):
-                rec_res[i] = (text, 0.0)
+                rec_res[i] = [text, 0.0]
 
         return rec_res, elapse

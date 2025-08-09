@@ -185,46 +185,51 @@ def result_to_middle_json(model_list, images_list, pdf_doc, image_writer, lang=N
             page_info = make_page_info_dict([], page_index, page_w, page_h, [])
         middle_json["pdf_info"].append(page_info)
 
-    """后置ocr处理"""
-    need_ocr_list = []
-    img_crop_list = []
-    text_block_list = []
-    for page_info in middle_json["pdf_info"]:
-        for block in page_info['preproc_blocks']:
-            if block['type'] in ['table', 'image']:
-                for sub_block in block['blocks']:
-                    if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
-                        text_block_list.append(sub_block)
-            elif block['type'] in ['text', 'title']:
+    """后置ocr处理（可禁用以减少额外的GPU→CPU往返）"""
+    disable_secondary_ocr_env = os.getenv('MINERU_DISABLE_SECONDARY_OCR', '').lower()
+    disable_secondary_ocr = disable_secondary_ocr_env in ['1', 'true', 'yes', 'on']
+    if disable_secondary_ocr:
+        logger.info('Secondary OCR is disabled by MINERU_DISABLE_SECONDARY_OCR. Skipping page-level np_img OCR.')
+    else:
+        need_ocr_list = []
+        img_crop_list = []
+        text_block_list = []
+        for page_info in middle_json["pdf_info"]:
+            for block in page_info['preproc_blocks']:
+                if block['type'] in ['table', 'image']:
+                    for sub_block in block['blocks']:
+                        if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
+                            text_block_list.append(sub_block)
+                elif block['type'] in ['text', 'title']:
+                    text_block_list.append(block)
+            for block in page_info['discarded_blocks']:
                 text_block_list.append(block)
-        for block in page_info['discarded_blocks']:
-            text_block_list.append(block)
-    for block in text_block_list:
-        for line in block['lines']:
-            for span in line['spans']:
-                if 'np_img' in span:
-                    need_ocr_list.append(span)
-                    img_crop_list.append(span['np_img'])
-                    span.pop('np_img')
-    if len(img_crop_list) > 0:
-        atom_model_manager = AtomModelSingleton()
-        ocr_model = atom_model_manager.get_atom_model(
-            atom_model_name='ocr',
-            ocr_show_log=False,
-            det_db_box_thresh=0.3,
-            lang=lang
-        )
-        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
-        assert len(ocr_res_list) == len(
-            need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
-        for index, span in enumerate(need_ocr_list):
-            ocr_text, ocr_score = ocr_res_list[index]
-            if ocr_score > OcrConfidence.min_confidence:
-                span['content'] = ocr_text
-                span['score'] = float(f"{ocr_score:.3f}")
-            else:
-                span['content'] = ''
-                span['score'] = 0.0
+        for block in text_block_list:
+            for line in block['lines']:
+                for span in line['spans']:
+                    if 'np_img' in span:
+                        need_ocr_list.append(span)
+                        img_crop_list.append(span['np_img'])
+                        span.pop('np_img')
+        if len(img_crop_list) > 0:
+            atom_model_manager = AtomModelSingleton()
+            ocr_model = atom_model_manager.get_atom_model(
+                atom_model_name='ocr',
+                ocr_show_log=False,
+                det_db_box_thresh=0.3,
+                lang=lang
+            )
+            ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+            assert len(ocr_res_list) == len(
+                need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
+            for index, span in enumerate(need_ocr_list):
+                ocr_text, ocr_score = ocr_res_list[index]
+                if ocr_score > OcrConfidence.min_confidence:
+                    span['content'] = ocr_text
+                    span['score'] = float(f"{ocr_score:.3f}")
+                else:
+                    span['content'] = ''
+                    span['score'] = 0.0
 
     """分段"""
     para_split(middle_json["pdf_info"])

@@ -1,5 +1,6 @@
 from loguru import logger
 
+import os
 from .pdf_image_tools import cut_image
 
 
@@ -9,6 +10,13 @@ def cut_image_and_table(span, page_pil_img, page_img_md5, page_id, image_writer,
         return f"{path_type}/{page_img_md5}"
 
     span_type = span["type"]
+
+    # 允许通过环境变量跳过临时图片的保存（不影响最终 JSON）
+    skip_tmp_images = os.getenv('MINERU_SKIP_TMP_IMAGES', '').lower() in ['1', 'true', 'yes', 'on']
+
+    if skip_tmp_images:
+        span["image_path"] = ""
+        return span
 
     if not check_img_bbox(span["bbox"]) or not image_writer:
         span["image_path"] = ""
