@@ -169,6 +169,7 @@ def get_all_access_pdf_paths():
 def run_test_task():
     t0 = time.time()
     pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")  # 使用新的testinput文件夹
+    pdf_files = pdf_files[:1]
     save_dir = "/cache/lizhen/repos/MinerU/demo/output_baseline_D2H"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"

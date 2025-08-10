@@ -182,9 +182,18 @@ class CTCLabelDecode(BaseRecLabelDecode):
 
     def __call__(self, preds, label=None, return_word_box=False, *args, **kwargs):
         if isinstance(preds, torch.Tensor):
-            preds = preds.numpy()
-        preds_idx = preds.argmax(axis=2)
-        preds_prob = preds.max(axis=2)
+            # 在 GPU 上先计算 argmax/amax，仅回传索引与概率，避免整张量回传
+            if preds.is_cuda:
+                preds_idx_t = torch.argmax(preds, dim=2)
+                preds_prob_t = torch.amax(preds, dim=2)
+                preds_idx = preds_idx_t.detach().cpu().numpy()
+                preds_prob = preds_prob_t.detach().cpu().numpy()
+            else:
+                preds_idx = torch.argmax(preds, dim=2).numpy()
+                preds_prob = torch.amax(preds, dim=2).numpy()
+        else:
+            preds_idx = preds.argmax(axis=2)
+            preds_prob = preds.max(axis=2)
         text = self.decode(
             preds_idx,
             preds_prob,
@@ -220,9 +229,9 @@ class NRTRLabelDecode(BaseRecLabelDecode):
             preds_id = preds[0]
             preds_prob = preds[1]
             if isinstance(preds_id, torch.Tensor):
-                preds_id = preds_id.numpy()
+                preds_id = preds_id.detach().cpu().numpy()
             if isinstance(preds_prob, torch.Tensor):
-                preds_prob = preds_prob.numpy()
+                preds_prob = preds_prob.detach().cpu().numpy()
             if preds_id[0][0] == 2:
                 preds_idx = preds_id[:, 1:]
                 preds_prob = preds_prob[:, 1:]
@@ -234,7 +243,7 @@ class NRTRLabelDecode(BaseRecLabelDecode):
             label = self.decode(label[:, 1:])
         else:
             if isinstance(preds, torch.Tensor):
-                preds = preds.numpy()
+                preds = preds.detach().cpu().numpy()
             preds_idx = preds.argmax(axis=2)
             preds_prob = preds.max(axis=2)
             text = self.decode(preds_idx, preds_prob, is_remove_duplicate=False)
@@ -280,7 +289,7 @@ class ViTSTRLabelDecode(NRTRLabelDecode):
 
     def __call__(self, preds, label=None, *args, **kwargs):
         if isinstance(preds, torch.Tensor):
-            preds = preds[:, 1:].numpy()
+            preds = preds[:, 1:].detach().cpu().numpy()
         else:
             preds = preds[:, 1:]
         preds_idx = preds.argmax(axis=2)
@@ -482,7 +491,7 @@ class SRNLabelDecode(BaseRecLabelDecode):
         pred = preds['predict']
         char_num = len(self.character_str) + 2
         if isinstance(pred, torch.Tensor):
-            pred = pred.numpy()
+            pred = pred.detach().cpu().numpy()
         pred = np.reshape(pred, [-1, char_num])
 
         preds_idx = np.argmax(pred, axis=1)

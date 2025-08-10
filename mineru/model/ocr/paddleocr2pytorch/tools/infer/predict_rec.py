@@ -430,14 +430,9 @@ class TextRecognizer(BaseOCRV20):
                     preds = outputs
 
                 else:
-                    # 通常路径：一次性 D2H（可选）。当 MINERU_OCR_REC_ONE_D2H=1 且输出为 Tensor 时，累积到最后统一 cpu()
+                    # 默认 CRNN/CTC 路径：将 GPU Tensor 直接传给解码器，
+                    # 由解码器在 GPU 上完成 argmax/max，仅回传索引/分数，避免大规模 D2H
                     starttime_total = time.time()
-                    one_d2h = str(os.getenv('MINERU_OCR_REC_ONE_D2H', '0')).lower() in ['1', 'true', 'yes', 'on']
-                    supported_single = True
-                    if 'gpu_pred_acc' not in locals():
-                        gpu_pred_acc = []
-                        acc_count = 0
-
                     with torch.no_grad():
                         inp = torch.from_numpy(norm_img_batch)
                         try:
@@ -446,39 +441,16 @@ class TextRecognizer(BaseOCRV20):
                             inp = inp.to(self.device)
                         prob_out = self.net(inp)
 
-                    if one_d2h and isinstance(prob_out, torch.Tensor):
-                        gpu_pred_acc.append(prob_out)
-                        acc_count += prob_out.shape[0]
-                        # 先不做 D2H，延后到循环外一次完成
-                        preds = None
-                    else:
-                        # 回退到原有逐批 D2H 路径
-                        supported_single = False
-                        if isinstance(prob_out, list):
-                            preds = [v.cpu().numpy() for v in prob_out]
-                        else:
-                            preds = prob_out.cpu().numpy()
-
-                    if preds is not None:
-                        rec_result = self.postprocess_op(preds)
-                        for rno in range(len(rec_result)):
-                            rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+                    rec_result = self.postprocess_op(prob_out)
+                    for rno in range(len(rec_result)):
+                        rec_res[indices[beg_img_no + rno]] = rec_result[rno]
                     elapse += time.time() - starttime_total
+                    # 更新进度条：本批实际处理的样本数
+                    current_batch_size = end_img_no - beg_img_no
+                    index += 1
+                    pbar.update(current_batch_size)
 
-            # 循环结束后，如开启单次 D2H 且收集到了 GPU 预测，统一一次 cpu() 并解码
-            if 'gpu_pred_acc' in locals() and one_d2h and len(gpu_pred_acc) > 0 and supported_single:
-                starttime = time.time()
-                preds_all = torch.cat(gpu_pred_acc, dim=0).to('cpu', non_blocking=False).numpy()
-                rec_result_all = self.postprocess_op(preds_all)
-                # rec_result_all 与 indices 排序一致，直接映射回原始顺序
-                for rno in range(len(rec_result_all)):
-                    rec_res[indices[rno]] = rec_result_all[rno]
-                elapse += time.time() - starttime
-
-                # 更新进度条，每次增加batch_size，但要注意最后一个batch可能不足batch_size
-                current_batch_size = min(batch_num, img_num - index * batch_num)
-                index += 1
-                pbar.update(current_batch_size)
+            # 单次 D2H 合并逻辑已移除，默认在 GPU 上先做 argmax/max，逐批解码并回传小结果
 
         # Fix NaN values in recognition results
         for i in range(len(rec_res)):
