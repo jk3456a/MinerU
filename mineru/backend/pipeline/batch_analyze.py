@@ -2,13 +2,14 @@ import cv2
 from loguru import logger
 from tqdm import tqdm
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
-import torch
 
 from .model_init import AtomModelSingleton
 from ...utils.config_reader import get_formula_enable, get_table_enable
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res
 from ...utils.ocr_utils import get_adjusted_mfdetrec_res, get_ocr_result_list, OcrConfidence
+import mineru.utils.nvtx_utils as nvtxu
 
 import os
 
@@ -102,23 +103,37 @@ class BatchAnalyze:
             # 收集所有需要OCR检测的裁剪图像
             all_cropped_images_info = []
 
-            for ocr_res_list_dict in ocr_res_list_all_page:
-                _lang = ocr_res_list_dict['lang']
+            # 允许并行裁剪与颜色转换，降低 Python 循环/GIL 的影响
+            try:
+                ocr_crop_workers = int(os.getenv('MINERU_OCR_CROP_WORKERS', '0'))
+            except Exception:
+                ocr_crop_workers = 0
 
-                for res in ocr_res_list_dict['ocr_res_list']:
-                    new_image, useful_list = crop_img(
-                        res, ocr_res_list_dict['pil_img'], crop_paste_x=50, crop_paste_y=50
-                    )
-                    adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
-                        ocr_res_list_dict['single_page_mfdetrec_res'], useful_list
-                    )
+            def _crop_one(_ocr_res_list_dict, _res):
+                new_image, useful_list = crop_img(
+                    _res, _ocr_res_list_dict['pil_img'], crop_paste_x=50, crop_paste_y=50
+                )
+                adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
+                    _ocr_res_list_dict['single_page_mfdetrec_res'], useful_list
+                )
+                new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
+                return new_image, useful_list, _ocr_res_list_dict, _res, adjusted_mfdetrec_res, _ocr_res_list_dict['lang']
 
-                    # BGR转换
-                    new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
-
-                    all_cropped_images_info.append((
-                        new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang
-                    ))
+            if ocr_crop_workers and ocr_crop_workers > 1:
+                futures = []
+                with ThreadPoolExecutor(max_workers=ocr_crop_workers) as ex:
+                    for ocr_res_list_dict in ocr_res_list_all_page:
+                        for res in ocr_res_list_dict['ocr_res_list']:
+                            futures.append(ex.submit(_crop_one, ocr_res_list_dict, res))
+                    for fut in as_completed(futures):
+                        try:
+                            all_cropped_images_info.append(fut.result())
+                        except Exception:
+                            continue
+            else:
+                for ocr_res_list_dict in ocr_res_list_all_page:
+                    for res in ocr_res_list_dict['ocr_res_list']:
+                        all_cropped_images_info.append(_crop_one(ocr_res_list_dict, res))
 
             # 按语言分组
             lang_groups = defaultdict(list)
@@ -163,7 +178,48 @@ class BatchAnalyze:
                         batch_images.append(padded_img)
 
                     det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
-                    batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
+                    # VRAM 限制：根据每图尺寸与上限动态收缩 batch_size，避免显存溢出
+                    try:
+                        max_vram_gb_env = os.getenv('MINERU_OCR_DET_MAX_VRAM_GB')
+                        reserve_gb_env = os.getenv('MINERU_OCR_DET_VRAM_RESERVE_GB', '1')
+                        per_image_factor_env = os.getenv('MINERU_OCR_DET_PER_IMAGE_FACTOR', '1.2')
+                        if max_vram_gb_env is not None:
+                            max_vram_gb = float(max_vram_gb_env)
+                            reserve_gb = float(reserve_gb_env)
+                            usable_bytes = max(0.0, (max_vram_gb - reserve_gb)) * (1024**3)
+                            per_image_bytes = int(target_h * target_w * 3 * 4 * float(per_image_factor_env))
+                            if per_image_bytes > 0:
+                                safe_bsz = max(1, min(det_batch_size, int(usable_bytes // per_image_bytes)))
+                                det_batch_size = min(det_batch_size, safe_bsz)
+                    except Exception:
+                        pass
+                    def _run_det_with_shrink(images, init_bs):
+                        bs = max(1, init_bs)
+                        min_bsz = 1
+                        try:
+                            min_bsz = int(os.getenv('MINERU_OCR_DET_MIN_BSZ', '1'))
+                        except Exception:
+                            min_bsz = 1
+                        while True:
+                            try:
+                                with nvtxu.nvtx_range("ocr_model.text_detector.batch_predict"):
+                                    return ocr_model.text_detector.batch_predict(images, bs)
+                            except RuntimeError as e:
+                                msg = str(e).lower()
+                                if 'out of memory' in msg or 'cuda oom' in msg:
+                                    try:
+                                        import torch  # type: ignore
+                                        torch.cuda.empty_cache()
+                                    except Exception:
+                                        pass
+                                    new_bs = bs // 2
+                                    if new_bs < min_bsz:
+                                        raise
+                                    bs = new_bs
+                                else:
+                                    raise
+
+                    batch_results = _run_det_with_shrink(batch_images, det_batch_size)
 
                     for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(lang_crop_list, batch_results)):
                         new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
@@ -206,7 +262,48 @@ class BatchAnalyze:
                             batch_images.append(padded_img)
 
                         det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
-                        batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
+                        # VRAM 限制：根据每图尺寸与上限动态收缩 batch_size，避免显存溢出
+                        try:
+                            max_vram_gb_env = os.getenv('MINERU_OCR_DET_MAX_VRAM_GB')
+                            reserve_gb_env = os.getenv('MINERU_OCR_DET_VRAM_RESERVE_GB', '1')
+                            per_image_factor_env = os.getenv('MINERU_OCR_DET_PER_IMAGE_FACTOR', '1.2')
+                            if max_vram_gb_env is not None:
+                                max_vram_gb = float(max_vram_gb_env)
+                                reserve_gb = float(reserve_gb_env)
+                                usable_bytes = max(0.0, (max_vram_gb - reserve_gb)) * (1024**3)
+                                per_image_bytes = int(target_h * target_w * 3 * 4 * float(per_image_factor_env))
+                                if per_image_bytes > 0:
+                                    safe_bsz = max(1, min(det_batch_size, int(usable_bytes // per_image_bytes)))
+                                    det_batch_size = min(det_batch_size, safe_bsz)
+                        except Exception:
+                            pass
+                        def _run_det_with_shrink(images, init_bs):
+                            bs = max(1, init_bs)
+                            min_bsz = 1
+                            try:
+                                min_bsz = int(os.getenv('MINERU_OCR_DET_MIN_BSZ', '1'))
+                            except Exception:
+                                min_bsz = 1
+                            while True:
+                                try:
+                                    with nvtxu.nvtx_range("ocr_model.text_detector.batch_predict"):
+                                        return ocr_model.text_detector.batch_predict(images, bs)
+                                except RuntimeError as e:
+                                    msg = str(e).lower()
+                                    if 'out of memory' in msg or 'cuda oom' in msg:
+                                        try:
+                                            import torch  # type: ignore
+                                            torch.cuda.empty_cache()
+                                        except Exception:
+                                            pass
+                                        new_bs = bs // 2
+                                        if new_bs < min_bsz:
+                                            raise
+                                        bs = new_bs
+                                    else:
+                                        raise
+
+                        batch_results = _run_det_with_shrink(batch_images, det_batch_size)
                         for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
                             new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
                             if dt_boxes is not None and len(dt_boxes) > 0:

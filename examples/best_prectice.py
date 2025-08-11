@@ -15,6 +15,7 @@ from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
+import mineru.utils.nvtx_utils as nvtxu
 
 # 添加日志配置
 from loguru import logger
@@ -75,14 +76,15 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
     logger.info(f"Formula enable: {formula_enable}, Table enable: {table_enable}")
     
     t2_1 = time.time()
-    infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
-        pipeline_doc_analyze(
-            [new_pdf_bytes],
-            [lang],
-            parse_method="ocr",
-            formula_enable=formula_enable, table_enable=table_enable
+    with nvtxu.nvtx_range("pipeline_doc_analyze: " + pdf_name):
+        infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
+            pipeline_doc_analyze(
+                [new_pdf_bytes],
+                [lang],
+                parse_method="ocr",
+                formula_enable=formula_enable, table_enable=table_enable
+            )
         )
-    )
     t3 = time.time()
     
     # 计算页数
@@ -99,7 +101,7 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
 
     model_json = copy.deepcopy(model_list)
 
-    local_image_dir = f"/cache/lizhen/repos/MinerU/demo/output_baseline_D2H/{pdf_name}"
+    local_image_dir = f"/cache/lizhen/repos/mineru/MinerU/output/best_prectice/{pdf_name}"
     if not os.path.exists(local_image_dir):
         os.system(f"mkdir -p {local_image_dir}")
     image_writer = FileBasedDataWriter(local_image_dir)
@@ -171,7 +173,7 @@ def run_test_task():
     t0 = time.time()
     pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")  # 使用新的testinput文件夹
     pdf_files = pdf_files[:1]
-    save_dir = "/cache/lizhen/repos/MinerU/demo/output_baseline_D2H"
+    save_dir = "/cache/lizhen/repos/mineru/MinerU/output/best_prectice"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"
     
@@ -226,21 +228,33 @@ if __name__ == "__main__":
     t0 = time.time()
     os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"
+    os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"
     os.environ["MINERU_SKIP_TMP_IMAGES"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
     os.environ["MINERU_OCR_DET_MERGE_BUCKETS"] = "0"
-    os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"
     os.environ["MINERU_OCR_REC_ONE_D2H"] = "1"
+    os.environ["MINERU_NVTX_ENABLE"] = "1"
+    
+    os.environ["OMP_NUM_THREADS"] = "16"
+    os.environ["MKL_NUM_THREADS"] = "16"
+    os.environ["OPENBLAS_NUM_THREADS"] = "16"
+    os.environ["MINERU_TORCH_NUM_THREADS"] = "16"
+    os.environ["MINERU_TORCH_NUM_INTEROP_THREADS"] = "2"
+    os.environ["MINERU_OPENCV_NUM_THREADS"] = "16"
+    os.environ["MINERU_MFR_DATALOADER_WORKERS"] = "8"
+    os.environ["MINERU_PDF_RENDER_WORKERS"] = "16"
+    os.environ["MINERU_OCR_CROP_WORKERS"] = "20"
     
     logger.info("Starting baseline OCR processing...")
     logger.info(f"MINERU_MODEL_SOURCE: {os.environ['MINERU_MODEL_SOURCE']}")
     logger.info(f"MINERU_VIRTUAL_VRAM_SIZE: {os.environ['MINERU_VIRTUAL_VRAM_SIZE']}")
     
     # MineruPipelineModel(device="cuda")
-    main()
+    # main()
     # split_all_books()
     # copy_left_books()
-    # run_test_task()
+    run_test_task()
     
     total_time = time.time() - t0
     logger.info(f'Total time: {total_time:.2f} seconds')

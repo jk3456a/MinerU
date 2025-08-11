@@ -9,6 +9,7 @@ from mineru.utils.config_reader import get_device
 from ...utils.pdf_classify import classify
 from ...utils.pdf_image_tools import load_images_from_pdf
 from ...utils.model_utils import get_vram, clean_memory
+import mineru.utils.nvtx_utils as nvtxu
 
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
@@ -79,6 +80,34 @@ def doc_analyze(
     """
     import time
     t0 = time.time()
+
+    # Apply thread settings via env vars for non-CLI (best practice) usage
+    # MINERU_TORCH_NUM_THREADS / MINERU_TORCH_NUM_INTEROP_THREADS / MINERU_OPENCV_NUM_THREADS
+    try:
+        torch_num_threads = os.getenv('MINERU_TORCH_NUM_THREADS')
+        if torch_num_threads:
+            try:
+                import torch  # type: ignore
+                torch.set_num_threads(int(torch_num_threads))
+            except Exception:
+                pass
+        torch_num_interop_threads = os.getenv('MINERU_TORCH_NUM_INTEROP_THREADS')
+        if torch_num_interop_threads:
+            try:
+                import torch  # type: ignore
+                torch.set_num_interop_threads(int(torch_num_interop_threads))
+            except Exception:
+                pass
+        opencv_threads = os.getenv('MINERU_OPENCV_NUM_THREADS')
+        if opencv_threads:
+            try:
+                import cv2  # type: ignore
+                cv2.setNumThreads(int(opencv_threads))
+            except Exception:
+                pass
+    except Exception:
+        # best-effort; never block
+        pass
     
     min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
 
@@ -105,7 +134,8 @@ def doc_analyze(
         _lang = lang_list[pdf_idx]
 
         # 收集每个数据集中的页面
-        images_list, pdf_doc = load_images_from_pdf(pdf_bytes)
+        with nvtxu.nvtx_range("load_images_from_pdf"):
+            images_list, pdf_doc = load_images_from_pdf(pdf_bytes)
         all_image_lists.append(images_list)
         all_pdf_docs.append(pdf_doc)
         for page_idx in range(len(images_list)):

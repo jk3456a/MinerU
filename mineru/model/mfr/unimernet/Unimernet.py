@@ -49,7 +49,13 @@ class UnimernetModel(object):
             mf_image_list.append(bbox_img)
 
         dataset = MathDataset(mf_image_list, transform=self.model.transform)
-        dataloader = DataLoader(dataset, batch_size=32, num_workers=0)
+        # Allow configuring dataloader workers via env var
+        import os as _os
+        try:
+            _num_workers = int(_os.getenv('MINERU_MFR_DATALOADER_WORKERS', '0'))
+        except Exception:
+            _num_workers = 0
+        dataloader = DataLoader(dataset, batch_size=32, num_workers=_num_workers)
         mfr_res = []
         for mf_img in dataloader:
             mf_img = mf_img.to(dtype=self.model.dtype)
@@ -108,7 +114,13 @@ class UnimernetModel(object):
         # 如果batch_size > len(sorted_images)，则设置为不超过len(sorted_images)的2的幂
         batch_size = min(batch_size, max(1, 2 ** (len(sorted_images).bit_length() - 1))) if sorted_images else 1
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0)
+        # Allow configuring dataloader workers via env var
+        import os as _os
+        try:
+            _num_workers = int(_os.getenv('MINERU_MFR_DATALOADER_WORKERS', '0'))
+        except Exception:
+            _num_workers = 0
+        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=_num_workers)
 
         # Process batches and store results
         mfr_res = []

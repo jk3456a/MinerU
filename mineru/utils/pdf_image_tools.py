@@ -7,6 +7,35 @@ from PIL import Image
 
 from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.utils.pdf_reader import image_to_b64str, image_to_bytes, page_to_image
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+
+def _render_pages_chunk(args):
+    """Worker: 在子进程中渲染一组页面，返回 (page_index, image_dict) 列表。
+
+    注意：每个子进程各自打开 PdfDocument，避免跨进程共享对象带来的不安全。
+    """
+    pdf_bytes, dpi, indices = args
+    results = []
+    try:
+        doc = pdfium.PdfDocument(pdf_bytes)
+        for i in indices:
+            try:
+                page = doc[i]
+                pil_img, scale = page_to_image(page, dpi=dpi)
+                img_base64 = image_to_b64str(pil_img)
+                image_dict = {"img_base64": img_base64, "img_pil": pil_img, "scale": scale}
+                results.append((i, image_dict))
+            except Exception:
+                continue
+        try:
+            doc.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return results
 from .hash_utils import str_sha256
 
 
@@ -20,8 +49,12 @@ def pdf_page_to_image(page: pdfium.PdfPage, dpi=200) -> dict:
     Returns:
         dict:  {'img_base64': str, 'img_pil': pil_img, 'scale': float }
     """
+    # 固定使用传入的 dpi，不开放通过环境变量修改，以保持一致的渲染策略
     pil_img, scale = page_to_image(page, dpi=dpi)
-    img_base64 = image_to_b64str(pil_img)
+
+    # 允许通过环境变量跳过页级 base64 生成，减少 CPU 与内存
+    enable_b64 = str(os.getenv("MINERU_ENABLE_PAGE_BASE64", "0")).lower() in ["1", "true", "yes", "on"]
+    img_base64 = image_to_b64str(pil_img) if enable_b64 else ""
 
     image_dict = {
         "img_base64": img_base64,
@@ -45,8 +78,60 @@ def load_images_from_pdf(
         logger.warning("end_page_id is out of range, use images length")
         end_page_id = pdf_page_num - 1
 
-    for index in range(0, pdf_page_num):
-        if start_page_id <= index <= end_page_id:
+    # 生成目标页索引
+    target_indices = [i for i in range(pdf_page_num) if start_page_id <= i <= end_page_id]
+
+    # 并行渲染控制：优先线程池（MINERU_PDF_RENDER_THREADS），否则进程池（MINERU_PDF_RENDER_WORKERS），否则串行
+    threads = 0
+    workers = 0
+    try:
+        threads = int(os.getenv("MINERU_PDF_RENDER_THREADS", "0"))
+    except Exception:
+        threads = 0
+    try:
+        workers = int(os.getenv("MINERU_PDF_RENDER_WORKERS", "0"))
+    except Exception:
+        workers = 0
+
+    total_pages = len(target_indices)
+
+    if threads and threads > 1 and total_pages > 1:
+        logger.info(f"PDF render mode: threads={threads}, pages={total_pages}")
+        chunk_size = max(1, (total_pages + threads - 1) // threads)
+        chunks = [target_indices[i:i + chunk_size] for i in range(0, total_pages, chunk_size)]
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            for indices in chunks:
+                futures.append(executor.submit(_render_pages_chunk, (pdf_bytes, dpi, indices)))
+            tmp = []
+            for fut in as_completed(futures):
+                try:
+                    tmp.extend(fut.result())
+                except Exception:
+                    continue
+        tmp.sort(key=lambda x: x[0])
+        images_list = [image_dict for _, image_dict in tmp]
+    elif workers and workers > 1 and total_pages > 1:
+        logger.info(f"PDF render mode: processes={workers}, pages={total_pages}")
+        chunk_size = max(1, (total_pages + workers - 1) // workers)
+        chunks = [target_indices[i:i + chunk_size] for i in range(0, total_pages, chunk_size)]
+
+        futures = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            for indices in chunks:
+                futures.append(executor.submit(_render_pages_chunk, (pdf_bytes, dpi, indices)))
+            tmp = []
+            for fut in as_completed(futures):
+                try:
+                    tmp.extend(fut.result())
+                except Exception:
+                    continue
+        tmp.sort(key=lambda x: x[0])
+        images_list = [image_dict for _, image_dict in tmp]
+    else:
+        logger.info(f"PDF render mode: serial, pages={total_pages}")
+        for index in target_indices:
             page = pdf_doc[index]
             image_dict = pdf_page_to_image(page, dpi=dpi)
             images_list.append(image_dict)
