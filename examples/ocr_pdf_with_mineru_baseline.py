@@ -4,37 +4,6 @@ import os
 import random
 import traceback
 
-# 可修改
-os.environ["MINERU_MODEL_SOURCE"] = "modelscope"  # 模型来源（如 modelscope/本地），影响下载与加载
-os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"  # 虚拟显存(GB)，用于估算批处理比例/显存策略
-os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"  # 最小批推理页数，增大提升吞吐但耗内存/显存
-
-os.environ["MINERU_SKIP_TMP_IMAGES"] = "0"  # 跳过中间表格的存储以减少I/O
-
-# 优化的建议参数
-#####################################################
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # CUDA内存分配策略，降低碎片化
-os.environ["MINERU_OCR_DET_MERGE_BUCKETS"] = "0"  # 文本检测是否合并buckets(0关/1开)
-os.environ["MINERU_OCR_DET_BATCH_SIZE"] = "128"  # 文本检测批大小，越大吞吐越高但显存更多
-os.environ["MINERU_OCR_DET_ONE_D2H"] = "1"  # 检测阶段合并一次性D2H拷贝，减少传输
-os.environ["MINERU_OCR_REC_ONE_D2H"] = "1"  # 识别阶段合并一次性D2H拷贝，减少传输
-
-
-os.environ["OMP_NUM_THREADS"] = "16"  # OMP线程
-os.environ["MKL_NUM_THREADS"] = "16"  # MKL线程
-os.environ["OPENBLAS_NUM_THREADS"] = "16"  # OpenBLAS线程
-os.environ["MINERU_TORCH_NUM_THREADS"] = "16"  # PyTorch算子线程数
-os.environ["MINERU_TORCH_NUM_INTEROP_THREADS"] = "2"  # PyTorch线程间并发度
-os.environ["MINERU_OPENCV_NUM_THREADS"] = "16"  # OpenCV线程数
-os.environ["MINERU_MFR_DATALOADER_WORKERS"] = "8"  # 多模态/公式识别数据加载workers
-os.environ["MINERU_PDF_RENDER_WORKERS"] = "16"  # PDF渲染并发workers
-os.environ["MINERU_OCR_CROP_WORKERS"] = "20"  # OCR裁剪切图并发workers
-#####################################################
-
-# 调试用，目前不开启
-os.environ["MINERU_NVTX_ENABLE"] = "0"  # 启用NVTX标注，配合nsys做性能分析
-os.environ["MINERU_LOG_ENABLE"] = "1"  # 启用日志输出
-
 import json
 
 import time
@@ -46,36 +15,34 @@ from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
-import mineru.utils.nvtx_utils as nvtxu
 
+# 给baseline用的脚本文件，用于同步观测
 # 添加日志配置
 from loguru import logger
-
-_LOG_ENABLE = os.environ.get("MINERU_LOG_ENABLE", "1") == "1"
 
 # 配置loguru日志格式
 logger.remove()  # 移除默认的处理器
 
+# 创建logs目录
+os.makedirs("logs", exist_ok=True)
+
 # 生成运行标识符
 run_id = str(uuid.uuid4())[:8]  # 取前8位作为运行ID
 
-if _LOG_ENABLE:
-    # 创建logs目录与添加日志输出
-    os.makedirs("logs", exist_ok=True)
-    logger.add(
-        "logs/best_prectice.log",  # 日志文件
-        format="\n{time:YYYY-MM-DD HH:mm:ss} | {level} | [{run_id}] {message}",
-        level="INFO",
-        rotation="10 MB",  # 日志文件大小超过10MB时轮转
-        retention="7 days",  # 保留7天的日志
-        filter=lambda record: record.update(run_id=run_id) or True
-    )
-    logger.add(
-        lambda msg: print(msg, end=""),  # 同时输出到控制台
-        format="{time:HH:mm:ss} | {level} | [{run_id}] {message}",
-        level="INFO",
-        filter=lambda record: record.update(run_id=run_id) or True
-    )
+logger.add(
+    "logs/baseline_30_D2H.log",  # 日志文件
+    format="\n{time:YYYY-MM-DD HH:mm:ss} | {level} | [{run_id}] {message}",
+    level="INFO",
+    rotation="10 MB",  # 日志文件大小超过10MB时轮转
+    retention="7 days",  # 保留7天的日志
+    filter=lambda record: record.update(run_id=run_id) or True
+)
+logger.add(
+    lambda msg: print(msg, end=""),  # 同时输出到控制台
+    format="{time:HH:mm:ss} | {level} | [{run_id}] {message}",
+    level="INFO",
+    filter=lambda record: record.update(run_id=run_id) or True
+)
 
 # 添加运行开始标识
 logger.info("=" * 80)
@@ -109,15 +76,14 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
     logger.info(f"Formula enable: {formula_enable}, Table enable: {table_enable}")
     
     t2_1 = time.time()
-    with nvtxu.nvtx_range("pipeline_doc_analyze: " + pdf_name):
-        infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
-            pipeline_doc_analyze(
-                [new_pdf_bytes],
-                [lang],
-                parse_method="ocr",
-                formula_enable=formula_enable, table_enable=table_enable
-            )
+    infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
+        pipeline_doc_analyze(
+            [new_pdf_bytes],
+            [lang],
+            parse_method="ocr",
+            formula_enable=formula_enable, table_enable=table_enable
         )
+    )
     t3 = time.time()
     
     # 计算页数
@@ -134,7 +100,7 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
 
     model_json = copy.deepcopy(model_list)
 
-    local_image_dir = f"/cache/lizhen/repos/mineru/MinerU/output/best_practice/{pdf_name}"
+    local_image_dir = f"/cache/lizhen/repos/mineru/MinerU/output/ocr_pdf_with_mineru_baseline/{pdf_name}"
     if not os.path.exists(local_image_dir):
         os.system(f"mkdir -p {local_image_dir}")
     image_writer = FileBasedDataWriter(local_image_dir)
@@ -187,7 +153,6 @@ def process_one_pdf_file(pdf_path, save_dir=None, lang="ch"):
 def get_all_access_pdf_paths():
     print(glob.glob("/*"))
     pdf_files = glob.glob(f"/paratera_ningxia/datasets/mb-serverless-spark/zhangxueren/libgen_en_pdf/*")
-    logger.info(f"{len(pdf_files)} {pdf_files[:10]}")
     print(f"{len(pdf_files)} {pdf_files[:10]}")
     book_names = set()
     with open("/paratera_ningxia/user/zhangxueren/libgen_pdf_hfw_to_process.list") as fi:
@@ -205,14 +170,14 @@ def get_all_access_pdf_paths():
 def run_test_task():
     t0 = time.time()
     pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/input/sample_pdf_300/*pdf")  # 使用新的testinput文件夹
-    # pdf_files = pdf_files[:1]
+    #pdf按照名称排序前100篇
     pdf_files = sorted(pdf_files)[:100]
     save_dir = "/cache/lizhen/repos/mineru/MinerU/output/best_practice"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"
     
     logger.info(f"Found {len(pdf_files)} documents to process")
-    logger.info(f"Input directory: /cache/lizhen/repos/MinerU/demo/testinput")
+    logger.info(f"Input directory: /cache/lizhen/repos/mineru/MinerU/demo/test_pdfs")
     logger.info(f"Output directory: {save_dir}")
     
     t1 = time.time()
@@ -260,7 +225,9 @@ def main():
 
 if __name__ == "__main__":
     t0 = time.time()
-
+    # os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
+    # os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"
+    # os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "512"
     
     logger.info("Starting baseline OCR processing...")
     logger.info(f"MINERU_MODEL_SOURCE: {os.environ['MINERU_MODEL_SOURCE']}")

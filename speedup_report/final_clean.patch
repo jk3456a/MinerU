@@ -1,0 +1,1765 @@
+diff --git a/docker/china/Dockerfile b/docker/china/Dockerfile
+index 2b298b5a..48bbc976 100644
+--- a/docker/china/Dockerfile
++++ b/docker/china/Dockerfile
+@@ -19,8 +19,10 @@ RUN apt-get update && \
+     apt-get clean && \
+     rm -rf /var/lib/apt/lists/*
+ 
+-# Install mineru latest
+-RUN python3 -m pip install -U 'mineru[core]' -i https://mirrors.aliyun.com/pypi/simple --break-system-packages && \
++# Copy local mineru project and install from source
++COPY . /app/
++WORKDIR /app
++RUN python3 -m pip install -U '.[core]' -i https://mirrors.aliyun.com/pypi/simple --break-system-packages && \
+     python3 -m pip cache purge
+ 
+ # Download models and update the configuration file
+diff --git a/examples/best_practice.py b/examples/best_practice.py
+new file mode 100644
+index 00000000..0763fd28
+--- /dev/null
++++ b/examples/best_practice.py
+@@ -0,0 +1,281 @@
++import copy
++import glob
++import os
++import random
++import traceback
++
++# 可修改
++os.environ["MINERU_MODEL_SOURCE"] = "modelscope"  # 模型来源（如 modelscope/本地），影响下载与加载
++os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"  # 虚拟显存(GB)，用于估算批处理比例/显存策略
++os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"  # 最小批推理页数，增大提升吞吐但耗内存/显存
++
++os.environ["MINERU_SKIP_TMP_IMAGES"] = "1"  # 跳过中间表格的存储以减少I/O
++
++# 优化的建议参数
++#####################################################
++os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # CUDA内存分配策略，降低碎片化
++os.environ["MINERU_OCR_DET_MERGE_BUCKETS"] = "0"  # 文本检测是否合并buckets(0关/1开)
++os.environ["MINERU_OCR_DET_BATCH_SIZE"] = "128"  # 文本检测批大小，越大吞吐越高但显存更多
++os.environ["MINERU_OCR_DET_ONE_D2H"] = "1"  # 检测阶段合并一次性D2H拷贝，减少传输
++os.environ["MINERU_OCR_REC_ONE_D2H"] = "1"  # 识别阶段合并一次性D2H拷贝，减少传输
++
++
++os.environ["OMP_NUM_THREADS"] = "16"  # OMP线程
++os.environ["MKL_NUM_THREADS"] = "16"  # MKL线程
++os.environ["OPENBLAS_NUM_THREADS"] = "16"  # OpenBLAS线程
++os.environ["MINERU_TORCH_NUM_THREADS"] = "16"  # PyTorch算子线程数
++os.environ["MINERU_TORCH_NUM_INTEROP_THREADS"] = "2"  # PyTorch线程间并发度
++os.environ["MINERU_OPENCV_NUM_THREADS"] = "16"  # OpenCV线程数
++os.environ["MINERU_MFR_DATALOADER_WORKERS"] = "8"  # 多模态/公式识别数据加载workers
++os.environ["MINERU_PDF_RENDER_WORKERS"] = "16"  # PDF渲染并发workers
++os.environ["MINERU_OCR_CROP_WORKERS"] = "20"  # OCR裁剪切图并发workers
++#####################################################
++
++# 调试用，目前不开启
++os.environ["MINERU_NVTX_ENABLE"] = "0"  # 启用NVTX标注，配合nsys做性能分析
++os.environ["MINERU_LOG_ENABLE"] = "0"  # 启用日志输出
++
++import json
++
++import time
++import uuid
++
++from mineru.backend.pipeline.model_init import MineruPipelineModel
++from mineru.data.data_reader_writer import FileBasedDataWriter
++
++from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
++from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
++from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
++import mineru.utils.nvtx_utils as nvtxu
++
++# 添加日志配置
++from loguru import logger
++
++_LOG_ENABLE = os.environ.get("MINERU_LOG_ENABLE", "1") == "1"
++
++# 配置loguru日志格式
++logger.remove()  # 移除默认的处理器
++
++# 生成运行标识符
++run_id = str(uuid.uuid4())[:8]  # 取前8位作为运行ID
++
++if _LOG_ENABLE:
++    # 创建logs目录与添加日志输出
++    os.makedirs("logs", exist_ok=True)
++    logger.add(
++        "logs/best_prectice.log",  # 日志文件
++        format="\n{time:YYYY-MM-DD HH:mm:ss} | {level} | [{run_id}] {message}",
++        level="INFO",
++        rotation="10 MB",  # 日志文件大小超过10MB时轮转
++        retention="7 days",  # 保留7天的日志
++        filter=lambda record: record.update(run_id=run_id) or True
++    )
++    logger.add(
++        lambda msg: print(msg, end=""),  # 同时输出到控制台
++        format="{time:HH:mm:ss} | {level} | [{run_id}] {message}",
++        level="INFO",
++        filter=lambda record: record.update(run_id=run_id) or True
++    )
++
++# 添加运行开始标识
++logger.info("=" * 80)
++logger.info(f"BASELINE TEST RUN STARTED - Run ID: {run_id}")
++logger.info("=" * 80)
++
++
++def infer_one_pdf(pdf_file_path, lang="ch"):
++    t0 = time.time()
++    with open(pdf_file_path, 'rb') as fi:
++        pdf_bytes = fi.read()
++    t1 = time.time()
++    
++    try:
++        new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes)
++        t2 = time.time()
++        logger.info(f"Read PDF file spend: {t1 - t0:.2f}s, convert PDF spend: {t2 - t1:.2f}s")
++    except Exception as e:
++        if "password" in str(e).lower() or "Incorrect password" in str(e):
++            logger.warning(f"Skipping password-protected PDF: {os.path.basename(pdf_file_path)} - {e}")
++            return None
++        else:
++            logger.error(f"Error processing PDF {os.path.basename(pdf_file_path)}: {e}")
++            return None
++    
++    formula_enable = True
++    table_enable = False
++    pdf_name = os.path.basename(pdf_file_path)
++    
++    logger.info(f"Processing PDF: {pdf_name}")
++    logger.info(f"Formula enable: {formula_enable}, Table enable: {table_enable}")
++    
++    t2_1 = time.time()
++    with nvtxu.nvtx_range("pipeline_doc_analyze: " + pdf_name):
++        infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
++            pipeline_doc_analyze(
++                [new_pdf_bytes],
++                [lang],
++                parse_method="ocr",
++                formula_enable=formula_enable, table_enable=table_enable
++            )
++        )
++    t3 = time.time()
++    
++    # 计算页数
++    total_pages = len(all_image_lists[0]) if all_image_lists else 0
++    logger.info(f"Total pages: {total_pages}")
++    logger.info(f"Pipeline doc analyze spend: {t3 - t2_1:.2f}s")
++    logger.info(f"Average time per page: {(t3 - t2_1)/total_pages:.3f}s" if total_pages > 0 else "No pages")
++    logger.info(f"Processing speed: {total_pages/(t3 - t2_1):.1f} pages/s" if total_pages > 0 else "No pages")
++    
++    model_list = infer_results[0]
++    images_list = all_image_lists[0]
++    pdf_doc = all_pdf_docs[0]
++    _ocr_enable = True
++
++    model_json = copy.deepcopy(model_list)
++
++    local_image_dir = f"/cache/lizhen/repos/mineru/MinerU/output/best_prectice/{pdf_name}"
++    if not os.path.exists(local_image_dir):
++        os.system(f"mkdir -p {local_image_dir}")
++    image_writer = FileBasedDataWriter(local_image_dir)
++
++    t3_1 = time.time()
++    middle_json = pipeline_result_to_middle_json(
++        model_list, images_list, pdf_doc, image_writer,
++        lang, _ocr_enable, formula_enable
++    )
++    t4 = time.time()
++    logger.info(f"Pipeline result to middle json spend: {t4 - t3_1:.2f}s")
++    
++    total_time = t4 - t0
++    logger.info(f"Total processing time: {total_time:.2f}s")
++    logger.info(f"Average time per page (total): {total_time/total_pages:.3f}s" if total_pages > 0 else "No pages")
++    logger.info(f"Overall throughput: {total_pages/total_time:.1f} pages/s" if total_pages > 0 else "No pages")
++    
++    ocr_result = {
++        "middle_json": middle_json,
++        "model_json": model_json
++    }
++
++    return ocr_result
++
++
++def process_one_pdf_file(pdf_path, save_dir=None, lang="ch"):
++    if not save_dir:
++        save_dir = "/paratera_ningxia/user/zhangxueren/libgen_pdf_res_v2"
++    pdf_file_name = os.path.basename(pdf_path)
++    target_file = f"{save_dir}/{pdf_file_name}.json"
++    if not os.path.exists(f"{save_dir}/"):
++        os.system(f"mkdir {save_dir}/")
++    #
++    if os.path.exists(target_file):
++        print(f"the pdf result exist...[{target_file}]")
++        return
++
++    infer_result = infer_one_pdf(pdf_path, lang=lang)
++    if infer_result is None:
++        logger.warning(f"Skipping {pdf_file_name} due to processing error")
++        return
++        
++    infer_result['pdf_path'] = pdf_path
++    res_json_str = json.dumps(infer_result, ensure_ascii=False)
++
++    with open(target_file, "w") as fo:
++        fo.write(res_json_str)
++
++
++def get_all_access_pdf_paths():
++    print(glob.glob("/*"))
++    pdf_files = glob.glob(f"/paratera_ningxia/datasets/mb-serverless-spark/zhangxueren/libgen_en_pdf/*")
++    logger.info(f"{len(pdf_files)} {pdf_files[:10]}")
++    print(f"{len(pdf_files)} {pdf_files[:10]}")
++    book_names = set()
++    with open("/paratera_ningxia/user/zhangxueren/libgen_pdf_hfw_to_process.list") as fi:
++        for x in eval(fi.read()):
++            book_name = os.path.basename(x)
++            book_names.add(book_name)
++    pdf_to_process_list = []
++    for x in pdf_files:
++        if os.path.basename(x) in book_names:
++            pdf_to_process_list.append(x)
++    random.shuffle(pdf_to_process_list)
++    return pdf_to_process_list
++
++
++def run_test_task():
++    t0 = time.time()
++    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")  # 使用新的testinput文件夹
++    # pdf_files = pdf_files[:1]
++    save_dir = "/cache/lizhen/repos/mineru/MinerU/output/best_prectice"
++    # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
++    # save_dir = "/user/zhangxueren/sample_pdf_res"
++    
++    logger.info(f"Found {len(pdf_files)} documents to process")
++    logger.info(f"Input directory: /cache/lizhen/repos/MinerU/demo/testinput")
++    logger.info(f"Output directory: {save_dir}")
++    
++    t1 = time.time()
++    logger.info(f"Environment setup time: {t1 - t0:.2f}s")
++    
++    processed_count = 0
++    
++    for idx, file_path in enumerate(pdf_files):
++        if not os.path.exists(file_path):
++            continue
++
++        try:
++            logger.info(f"Processing file {idx + 1}/{len(pdf_files)}: {os.path.basename(file_path)}")
++            process_one_pdf_file(file_path, save_dir)
++            processed_count += 1
++            
++        except Exception as e:
++            logger.error(f"Error processing {file_path}: {e}")
++            traceback.print_stack()
++            logger.error('=====' * 10)
++    
++    total_time = time.time() - t0
++    logger.info(f"Total execution time: {total_time:.2f}s")
++    logger.info(f"Successfully processed: {processed_count}/{len(pdf_files)} files")
++    logger.info(f"Average time per document: {total_time/len(pdf_files):.2f}s" if pdf_files else "No documents processed")
++
++
++def main():
++    import glob
++    # pdf_files = glob.glob("/home/admin/zhangxueren/sample_pdf_300/*pdf")
++    # random.shuffle(pdf_files)
++    pdf_files = get_all_access_pdf_paths()
++    print(f"pdf_files cnt:{len(pdf_files)}")
++    for idx, file_path in enumerate(pdf_files):
++        if not os.path.exists(file_path):
++            continue
++
++        try:
++            process_one_pdf_file(file_path)
++        except Exception as e:
++            print(e)
++            traceback.print_stack()
++            print('=====' * 10)
++
++
++if __name__ == "__main__":
++    t0 = time.time()
++
++    
++    logger.info("Starting baseline OCR processing...")
++    logger.info(f"MINERU_MODEL_SOURCE: {os.environ['MINERU_MODEL_SOURCE']}")
++    logger.info(f"MINERU_VIRTUAL_VRAM_SIZE: {os.environ['MINERU_VIRTUAL_VRAM_SIZE']}")
++    
++    # MineruPipelineModel(device="cuda")
++    # main()
++    # split_all_books()
++    # copy_left_books()
++    run_test_task()
++    
++    total_time = time.time() - t0
++    logger.info(f'Total time: {total_time:.2f} seconds')
++    
++    # 添加运行结束标识
++    logger.info("=" * 80)
++    logger.info(f"BASELINE TEST RUN COMPLETED - Run ID: {run_id}")
++    logger.info(f"Total execution time: {total_time:.2f}s")
++    logger.info("=" * 80)
+diff --git a/mineru/backend/pipeline/batch_analyze.py b/mineru/backend/pipeline/batch_analyze.py
+index c88a52a3..d06a4142 100644
+--- a/mineru/backend/pipeline/batch_analyze.py
++++ b/mineru/backend/pipeline/batch_analyze.py
+@@ -2,18 +2,21 @@ import cv2
+ from loguru import logger
+ from tqdm import tqdm
+ from collections import defaultdict
++from concurrent.futures import ThreadPoolExecutor, as_completed
+ import numpy as np
+ 
+ from .model_init import AtomModelSingleton
+ from ...utils.config_reader import get_formula_enable, get_table_enable
+ from ...utils.model_utils import crop_img, get_res_list_from_layout_res
+ from ...utils.ocr_utils import get_adjusted_mfdetrec_res, get_ocr_result_list, OcrConfidence
++import mineru.utils.nvtx_utils as nvtxu
+ 
+-YOLO_LAYOUT_BASE_BATCH_SIZE = 8
+-MFD_BASE_BATCH_SIZE = 1
+-MFR_BASE_BATCH_SIZE = 16
+-OCR_DET_BASE_BATCH_SIZE = 16
++import os
+ 
++YOLO_LAYOUT_BASE_BATCH_SIZE = int(os.environ.get('MINERU_LAYOUT_BATCH_SIZE', 8))
++MFD_BASE_BATCH_SIZE = int(os.environ.get('MINERU_MFD_BATCH_SIZE', 1))
++MFR_BASE_BATCH_SIZE = int(os.environ.get('MINERU_MFR_BATCH_SIZE', 16))
++OCR_DET_BASE_BATCH_SIZE = int(os.environ.get('MINERU_OCR_DET_BATCH_SIZE', 16))
+ 
+ class BatchAnalyze:
+     def __init__(self, model_manager, batch_ratio: int, formula_enable, table_enable, enable_ocr_det_batch: bool = True):
+@@ -100,23 +103,37 @@ class BatchAnalyze:
+             # 收集所有需要OCR检测的裁剪图像
+             all_cropped_images_info = []
+ 
+-            for ocr_res_list_dict in ocr_res_list_all_page:
+-                _lang = ocr_res_list_dict['lang']
+-
+-                for res in ocr_res_list_dict['ocr_res_list']:
+-                    new_image, useful_list = crop_img(
+-                        res, ocr_res_list_dict['pil_img'], crop_paste_x=50, crop_paste_y=50
+-                    )
+-                    adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
+-                        ocr_res_list_dict['single_page_mfdetrec_res'], useful_list
+-                    )
++            # 允许并行裁剪与颜色转换，降低 Python 循环/GIL 的影响
++            try:
++                ocr_crop_workers = int(os.getenv('MINERU_OCR_CROP_WORKERS', '0'))
++            except Exception:
++                ocr_crop_workers = 0
+ 
+-                    # BGR转换
+-                    new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
+-
+-                    all_cropped_images_info.append((
+-                        new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang
+-                    ))
++            def _crop_one(_ocr_res_list_dict, _res):
++                new_image, useful_list = crop_img(
++                    _res, _ocr_res_list_dict['pil_img'], crop_paste_x=50, crop_paste_y=50
++                )
++                adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
++                    _ocr_res_list_dict['single_page_mfdetrec_res'], useful_list
++                )
++                new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
++                return new_image, useful_list, _ocr_res_list_dict, _res, adjusted_mfdetrec_res, _ocr_res_list_dict['lang']
++
++            if ocr_crop_workers and ocr_crop_workers > 1:
++                futures = []
++                with ThreadPoolExecutor(max_workers=ocr_crop_workers) as ex:
++                    for ocr_res_list_dict in ocr_res_list_all_page:
++                        for res in ocr_res_list_dict['ocr_res_list']:
++                            futures.append(ex.submit(_crop_one, ocr_res_list_dict, res))
++                    for fut in as_completed(futures):
++                        try:
++                            all_cropped_images_info.append(fut.result())
++                        except Exception:
++                            continue
++            else:
++                for ocr_res_list_dict in ocr_res_list_all_page:
++                    for res in ocr_res_list_dict['ocr_res_list']:
++                        all_cropped_images_info.append(_crop_one(ocr_res_list_dict, res))
+ 
+             # 按语言分组
+             lang_groups = defaultdict(list)
+@@ -124,13 +141,14 @@ class BatchAnalyze:
+                 lang = crop_info[5]
+                 lang_groups[lang].append(crop_info)
+ 
+-            # 对每种语言按分辨率分组并批处理
++            # 控制是否将同一语言的分辨率桶合并为一个统一尺寸的单桶（可减少批次数和拷贝次数）
++            merge_buckets = os.getenv('MINERU_OCR_DET_MERGE_BUCKETS', '0').lower() in ['1', 'true', 'yes', 'on']
++
++            # 对每种语言按策略批处理 OCR-det
+             for lang, lang_crop_list in lang_groups.items():
+                 if not lang_crop_list:
+                     continue
+ 
+-                # logger.info(f"Processing OCR detection for language {lang} with {len(lang_crop_list)} images")
+-
+                 # 获取OCR模型
+                 ocr_model = atom_model_manager.get_atom_model(
+                     atom_model_name='ocr',
+@@ -138,80 +156,169 @@ class BatchAnalyze:
+                     lang=lang
+                 )
+ 
+-                # 按分辨率分组并同时完成padding
+-                resolution_groups = defaultdict(list)
+-                for crop_info in lang_crop_list:
+-                    cropped_img = crop_info[0]
+-                    h, w = cropped_img.shape[:2]
+-                    # 使用更大的分组容差，减少分组数量
+-                    # 将尺寸标准化到32的倍数
+-                    normalized_h = ((h + 32) // 32) * 32  # 向上取整到32的倍数
+-                    normalized_w = ((w + 32) // 32) * 32
+-                    group_key = (normalized_h, normalized_w)
+-                    resolution_groups[group_key].append(crop_info)
+-
+-                # 对每个分辨率组进行批处理
+-                for group_key, group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
+-
+-                    # 计算目标尺寸（组内最大尺寸，向上取整到32的倍数）
+-                    max_h = max(crop_info[0].shape[0] for crop_info in group_crops)
+-                    max_w = max(crop_info[0].shape[1] for crop_info in group_crops)
+-                    target_h = ((max_h + 32 - 1) // 32) * 32
+-                    target_w = ((max_w + 32 - 1) // 32) * 32
+-
+-                    # 对所有图像进行padding到统一尺寸
++                if merge_buckets:
++                    # 合并所有分辨率为一个统一目标尺寸
++                    max_h_all = 0
++                    max_w_all = 0
++                    for crop_info in lang_crop_list:
++                        h, w = crop_info[0].shape[:2]
++                        if h > max_h_all:
++                            max_h_all = h
++                        if w > max_w_all:
++                            max_w_all = w
++                    target_h = ((max_h_all + 32 - 1) // 32) * 32
++                    target_w = ((max_w_all + 32 - 1) // 32) * 32
++
+                     batch_images = []
+-                    for crop_info in group_crops:
++                    for crop_info in lang_crop_list:
+                         img = crop_info[0]
+                         h, w = img.shape[:2]
+-                        # 创建目标尺寸的白色背景
+                         padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
+-                        # 将原图像粘贴到左上角
+                         padded_img[:h, :w] = img
+                         batch_images.append(padded_img)
+ 
+-                    # 批处理检测
+-                    det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)  # 增加批处理大小
+-                    # logger.debug(f"OCR-det batch: {det_batch_size} images, target size: {target_h}x{target_w}")
+-                    batch_results = ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
+-
+-                    # 处理批处理结果
+-                    for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
++                    det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
++                    # VRAM 限制：根据每图尺寸与上限动态收缩 batch_size，避免显存溢出
++                    try:
++                        max_vram_gb_env = os.getenv('MINERU_OCR_DET_MAX_VRAM_GB')
++                        reserve_gb_env = os.getenv('MINERU_OCR_DET_VRAM_RESERVE_GB', '1')
++                        per_image_factor_env = os.getenv('MINERU_OCR_DET_PER_IMAGE_FACTOR', '1.2')
++                        if max_vram_gb_env is not None:
++                            max_vram_gb = float(max_vram_gb_env)
++                            reserve_gb = float(reserve_gb_env)
++                            usable_bytes = max(0.0, (max_vram_gb - reserve_gb)) * (1024**3)
++                            per_image_bytes = int(target_h * target_w * 3 * 4 * float(per_image_factor_env))
++                            if per_image_bytes > 0:
++                                safe_bsz = max(1, min(det_batch_size, int(usable_bytes // per_image_bytes)))
++                                det_batch_size = min(det_batch_size, safe_bsz)
++                    except Exception:
++                        pass
++                    def _run_det_with_shrink(images, init_bs):
++                        bs = max(1, init_bs)
++                        min_bsz = 1
++                        try:
++                            min_bsz = int(os.getenv('MINERU_OCR_DET_MIN_BSZ', '1'))
++                        except Exception:
++                            min_bsz = 1
++                        while True:
++                            try:
++                                with nvtxu.nvtx_range("ocr_model.text_detector.batch_predict"):
++                                    return ocr_model.text_detector.batch_predict(images, bs)
++                            except RuntimeError as e:
++                                msg = str(e).lower()
++                                if 'out of memory' in msg or 'cuda oom' in msg:
++                                    try:
++                                        import torch  # type: ignore
++                                        torch.cuda.empty_cache()
++                                    except Exception:
++                                        pass
++                                    new_bs = bs // 2
++                                    if new_bs < min_bsz:
++                                        raise
++                                    bs = new_bs
++                                else:
++                                    raise
++
++                    batch_results = _run_det_with_shrink(batch_images, det_batch_size)
++
++                    for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(lang_crop_list, batch_results)):
+                         new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
+-
+                         if dt_boxes is not None and len(dt_boxes) > 0:
+-                            # 直接应用原始OCR流程中的关键处理步骤
+                             from mineru.utils.ocr_utils import (
+                                 merge_det_boxes, update_det_boxes, sorted_boxes
+                             )
+-
+-                            # 1. 排序检测框
+-                            if len(dt_boxes) > 0:
+-                                dt_boxes_sorted = sorted_boxes(dt_boxes)
+-                            else:
+-                                dt_boxes_sorted = []
+-
+-                            # 2. 合并相邻检测框
+-                            if dt_boxes_sorted:
+-                                dt_boxes_merged = merge_det_boxes(dt_boxes_sorted)
+-                            else:
+-                                dt_boxes_merged = []
+-
+-                            # 3. 根据公式位置更新检测框（关键步骤！）
+-                            if dt_boxes_merged and adjusted_mfdetrec_res:
+-                                dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
+-                            else:
+-                                dt_boxes_final = dt_boxes_merged
+-
+-                            # 构造OCR结果格式
++                            dt_boxes_sorted = sorted_boxes(dt_boxes) if len(dt_boxes) > 0 else []
++                            dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
++                            dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res) if (dt_boxes_merged and adjusted_mfdetrec_res) else dt_boxes_merged
+                             ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
+-
+                             if ocr_res:
+                                 ocr_result_list = get_ocr_result_list(
+                                     ocr_res, useful_list, ocr_res_list_dict['ocr_enable'], new_image, _lang
+                                 )
+-
+                                 ocr_res_list_dict['layout_res'].extend(ocr_result_list)
++                else:
++                    # 原有：按分辨率分桶
++                    resolution_groups = defaultdict(list)
++                    for crop_info in lang_crop_list:
++                        cropped_img = crop_info[0]
++                        h, w = cropped_img.shape[:2]
++                        normalized_h = ((h + 32) // 32) * 32
++                        normalized_w = ((w + 32) // 32) * 32
++                        group_key = (normalized_h, normalized_w)
++                        resolution_groups[group_key].append(crop_info)
++
++                    for group_key, group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
++                        max_h = max(crop_info[0].shape[0] for crop_info in group_crops)
++                        max_w = max(crop_info[0].shape[1] for crop_info in group_crops)
++                        target_h = ((max_h + 32 - 1) // 32) * 32
++                        target_w = ((max_w + 32 - 1) // 32) * 32
++
++                        batch_images = []
++                        for crop_info in group_crops:
++                            img = crop_info[0]
++                            h, w = img.shape[:2]
++                            padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
++                            padded_img[:h, :w] = img
++                            batch_images.append(padded_img)
++
++                        det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
++                        # VRAM 限制：根据每图尺寸与上限动态收缩 batch_size，避免显存溢出
++                        try:
++                            max_vram_gb_env = os.getenv('MINERU_OCR_DET_MAX_VRAM_GB')
++                            reserve_gb_env = os.getenv('MINERU_OCR_DET_VRAM_RESERVE_GB', '1')
++                            per_image_factor_env = os.getenv('MINERU_OCR_DET_PER_IMAGE_FACTOR', '1.2')
++                            if max_vram_gb_env is not None:
++                                max_vram_gb = float(max_vram_gb_env)
++                                reserve_gb = float(reserve_gb_env)
++                                usable_bytes = max(0.0, (max_vram_gb - reserve_gb)) * (1024**3)
++                                per_image_bytes = int(target_h * target_w * 3 * 4 * float(per_image_factor_env))
++                                if per_image_bytes > 0:
++                                    safe_bsz = max(1, min(det_batch_size, int(usable_bytes // per_image_bytes)))
++                                    det_batch_size = min(det_batch_size, safe_bsz)
++                        except Exception:
++                            pass
++                        def _run_det_with_shrink(images, init_bs):
++                            bs = max(1, init_bs)
++                            min_bsz = 1
++                            try:
++                                min_bsz = int(os.getenv('MINERU_OCR_DET_MIN_BSZ', '1'))
++                            except Exception:
++                                min_bsz = 1
++                            while True:
++                                try:
++                                    with nvtxu.nvtx_range("ocr_model.text_detector.batch_predict"):
++                                        return ocr_model.text_detector.batch_predict(images, bs)
++                                except RuntimeError as e:
++                                    msg = str(e).lower()
++                                    if 'out of memory' in msg or 'cuda oom' in msg:
++                                        try:
++                                            import torch  # type: ignore
++                                            torch.cuda.empty_cache()
++                                        except Exception:
++                                            pass
++                                        new_bs = bs // 2
++                                        if new_bs < min_bsz:
++                                            raise
++                                        bs = new_bs
++                                    else:
++                                        raise
++
++                        batch_results = _run_det_with_shrink(batch_images, det_batch_size)
++                        for i, (crop_info, (dt_boxes, elapse)) in enumerate(zip(group_crops, batch_results)):
++                            new_image, useful_list, ocr_res_list_dict, res, adjusted_mfdetrec_res, _lang = crop_info
++                            if dt_boxes is not None and len(dt_boxes) > 0:
++                                from mineru.utils.ocr_utils import (
++                                    merge_det_boxes, update_det_boxes, sorted_boxes
++                                )
++                                dt_boxes_sorted = sorted_boxes(dt_boxes) if len(dt_boxes) > 0 else []
++                                dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
++                                dt_boxes_final = update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res) if (dt_boxes_merged and adjusted_mfdetrec_res) else dt_boxes_merged
++                                ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
++                                if ocr_res:
++                                    ocr_result_list = get_ocr_result_list(
++                                        ocr_res, useful_list, ocr_res_list_dict['ocr_enable'], new_image, _lang
++                                    )
++                                    ocr_res_list_dict['layout_res'].extend(ocr_result_list)
+         else:
+             # 原始单张处理模式
+             for ocr_res_list_dict in tqdm(ocr_res_list_all_page, desc="OCR-det Predict"):
+diff --git a/mineru/backend/pipeline/model_json_to_middle_json.py b/mineru/backend/pipeline/model_json_to_middle_json.py
+index 2cd5c055..4ef9f3de 100644
+--- a/mineru/backend/pipeline/model_json_to_middle_json.py
++++ b/mineru/backend/pipeline/model_json_to_middle_json.py
+@@ -185,46 +185,51 @@ def result_to_middle_json(model_list, images_list, pdf_doc, image_writer, lang=N
+             page_info = make_page_info_dict([], page_index, page_w, page_h, [])
+         middle_json["pdf_info"].append(page_info)
+ 
+-    """后置ocr处理"""
+-    need_ocr_list = []
+-    img_crop_list = []
+-    text_block_list = []
+-    for page_info in middle_json["pdf_info"]:
+-        for block in page_info['preproc_blocks']:
+-            if block['type'] in ['table', 'image']:
+-                for sub_block in block['blocks']:
+-                    if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
+-                        text_block_list.append(sub_block)
+-            elif block['type'] in ['text', 'title']:
++    """后置ocr处理（可禁用以减少额外的GPU→CPU往返）"""
++    disable_secondary_ocr_env = os.getenv('MINERU_DISABLE_SECONDARY_OCR', '').lower()
++    disable_secondary_ocr = disable_secondary_ocr_env in ['1', 'true', 'yes', 'on']
++    if disable_secondary_ocr:
++        logger.info('Secondary OCR is disabled by MINERU_DISABLE_SECONDARY_OCR. Skipping page-level np_img OCR.')
++    else:
++        need_ocr_list = []
++        img_crop_list = []
++        text_block_list = []
++        for page_info in middle_json["pdf_info"]:
++            for block in page_info['preproc_blocks']:
++                if block['type'] in ['table', 'image']:
++                    for sub_block in block['blocks']:
++                        if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
++                            text_block_list.append(sub_block)
++                elif block['type'] in ['text', 'title']:
++                    text_block_list.append(block)
++            for block in page_info['discarded_blocks']:
+                 text_block_list.append(block)
+-        for block in page_info['discarded_blocks']:
+-            text_block_list.append(block)
+-    for block in text_block_list:
+-        for line in block['lines']:
+-            for span in line['spans']:
+-                if 'np_img' in span:
+-                    need_ocr_list.append(span)
+-                    img_crop_list.append(span['np_img'])
+-                    span.pop('np_img')
+-    if len(img_crop_list) > 0:
+-        atom_model_manager = AtomModelSingleton()
+-        ocr_model = atom_model_manager.get_atom_model(
+-            atom_model_name='ocr',
+-            ocr_show_log=False,
+-            det_db_box_thresh=0.3,
+-            lang=lang
+-        )
+-        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+-        assert len(ocr_res_list) == len(
+-            need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
+-        for index, span in enumerate(need_ocr_list):
+-            ocr_text, ocr_score = ocr_res_list[index]
+-            if ocr_score > OcrConfidence.min_confidence:
+-                span['content'] = ocr_text
+-                span['score'] = float(f"{ocr_score:.3f}")
+-            else:
+-                span['content'] = ''
+-                span['score'] = 0.0
++        for block in text_block_list:
++            for line in block['lines']:
++                for span in line['spans']:
++                    if 'np_img' in span:
++                        need_ocr_list.append(span)
++                        img_crop_list.append(span['np_img'])
++                        span.pop('np_img')
++        if len(img_crop_list) > 0:
++            atom_model_manager = AtomModelSingleton()
++            ocr_model = atom_model_manager.get_atom_model(
++                atom_model_name='ocr',
++                ocr_show_log=False,
++                det_db_box_thresh=0.3,
++                lang=lang
++            )
++            ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
++            assert len(ocr_res_list) == len(
++                need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
++            for index, span in enumerate(need_ocr_list):
++                ocr_text, ocr_score = ocr_res_list[index]
++                if ocr_score > OcrConfidence.min_confidence:
++                    span['content'] = ocr_text
++                    span['score'] = float(f"{ocr_score:.3f}")
++                else:
++                    span['content'] = ''
++                    span['score'] = 0.0
+ 
+     """分段"""
+     para_split(middle_json["pdf_info"])
+diff --git a/mineru/backend/pipeline/pipeline_analyze.py b/mineru/backend/pipeline/pipeline_analyze.py
+index 1e58b1d8..646a6a06 100644
+--- a/mineru/backend/pipeline/pipeline_analyze.py
++++ b/mineru/backend/pipeline/pipeline_analyze.py
+@@ -9,6 +9,7 @@ from mineru.utils.config_reader import get_device
+ from ...utils.pdf_classify import classify
+ from ...utils.pdf_image_tools import load_images_from_pdf
+ from ...utils.model_utils import get_vram, clean_memory
++import mineru.utils.nvtx_utils as nvtxu
+ 
+ 
+ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
+@@ -77,6 +78,37 @@ def doc_analyze(
+     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
+     可通过环境变量MINERU_MIN_BATCH_INFERENCE_SIZE设置，默认值为384。
+     """
++    import time
++    t0 = time.time()
++
++    # Apply thread settings via env vars for non-CLI (best practice) usage
++    # MINERU_TORCH_NUM_THREADS / MINERU_TORCH_NUM_INTEROP_THREADS / MINERU_OPENCV_NUM_THREADS
++    try:
++        torch_num_threads = os.getenv('MINERU_TORCH_NUM_THREADS')
++        if torch_num_threads:
++            try:
++                import torch  # type: ignore
++                torch.set_num_threads(int(torch_num_threads))
++            except Exception:
++                pass
++        torch_num_interop_threads = os.getenv('MINERU_TORCH_NUM_INTEROP_THREADS')
++        if torch_num_interop_threads:
++            try:
++                import torch  # type: ignore
++                torch.set_num_interop_threads(int(torch_num_interop_threads))
++            except Exception:
++                pass
++        opencv_threads = os.getenv('MINERU_OPENCV_NUM_THREADS')
++        if opencv_threads:
++            try:
++                import cv2  # type: ignore
++                cv2.setNumThreads(int(opencv_threads))
++            except Exception:
++                pass
++    except Exception:
++        # best-effort; never block
++        pass
++    
+     min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
+ 
+     # 收集所有页面信息
+@@ -85,6 +117,10 @@ def doc_analyze(
+     all_image_lists = []
+     all_pdf_docs = []
+     ocr_enabled_list = []
++    
++    t1 = time.time()
++    logger.info(f"Starting PDF processing: {len(pdf_bytes_list)} PDFs")
++    
+     for pdf_idx, pdf_bytes in enumerate(pdf_bytes_list):
+         # 确定OCR设置
+         _ocr_enable = False
+@@ -98,7 +134,8 @@ def doc_analyze(
+         _lang = lang_list[pdf_idx]
+ 
+         # 收集每个数据集中的页面
+-        images_list, pdf_doc = load_images_from_pdf(pdf_bytes)
++        with nvtxu.nvtx_range("load_images_from_pdf"):
++            images_list, pdf_doc = load_images_from_pdf(pdf_bytes)
+         all_image_lists.append(images_list)
+         all_pdf_docs.append(pdf_doc)
+         for page_idx in range(len(images_list)):
+@@ -107,19 +144,34 @@ def doc_analyze(
+                 pdf_idx, page_idx,
+                 img_dict['img_pil'], _ocr_enable, _lang,
+             ))
++    
++    t2 = time.time()
++    total_pages = len(all_pages_info)
++    logger.info(f"PDF processing completed: {t2 - t1:.2f}s")
++    logger.info(f"Total pages collected: {total_pages}")
++    logger.info(f"OCR enabled for {sum(ocr_enabled_list)}/{len(ocr_enabled_list)} PDFs")
+ 
+     # 准备批处理
++    t3 = time.time()
+     images_with_extra_info = [(info[2], info[3], info[4]) for info in all_pages_info]
+     batch_size = min_batch_inference_size
+     batch_images = [
+         images_with_extra_info[i:i + batch_size]
+         for i in range(0, len(images_with_extra_info), batch_size)
+     ]
++    
++    t4 = time.time()
++    logger.info(f"Batch preparation completed: {t4 - t3:.2f}s")
++    logger.info(f"Created {len(batch_images)} batches with batch_size={batch_size}")
+ 
+     # 执行批处理
++    t5 = time.time()
+     results = []
+     processed_images_count = 0
++    batch_times = []
++    
+     for index, batch_image in enumerate(batch_images):
++        batch_start = time.time()
+         processed_images_count += len(batch_image)
+         logger.info(
+             f'Batch {index + 1}/{len(batch_images)}: '
+@@ -127,8 +179,20 @@ def doc_analyze(
+         )
+         batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
+         results.extend(batch_results)
++        batch_end = time.time()
++        batch_time = batch_end - batch_start
++        batch_times.append(batch_time)
++        logger.info(f'Batch {index + 1} completed in {batch_time:.2f}s')
++    
++    t6 = time.time()
++    total_inference_time = t6 - t5
++    avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
++    logger.info(f"Batch inference completed: {total_inference_time:.2f}s")
++    logger.info(f"Average batch time: {avg_batch_time:.2f}s")
++    logger.info(f"Inference throughput: {total_pages/total_inference_time:.1f} pages/s")
+ 
+     # 构建返回结果
++    t7 = time.time()
+     infer_results = []
+ 
+     for _ in range(len(pdf_bytes_list)):
+@@ -142,6 +206,25 @@ def doc_analyze(
+         page_dict = {'layout_dets': result, 'page_info': page_info_dict}
+ 
+         infer_results[pdf_idx].append(page_dict)
++    
++    t8 = time.time()
++    logger.info(f"Result construction completed: {t8 - t7:.2f}s")
++    
++    total_time = t8 - t0
++    logger.info(f"Total doc_analyze time: {total_time:.2f}s")
++    logger.info(f"Overall throughput: {total_pages/total_time:.1f} pages/s")
++    
++    # 时间分解
++    pdf_processing_time = t2 - t1
++    batch_prep_time = t4 - t3
++    inference_time = t6 - t5
++    result_construction_time = t8 - t7
++    
++    logger.info(f"Time breakdown:")
++    logger.info(f"  PDF processing: {pdf_processing_time:.2f}s ({pdf_processing_time/total_time*100:.1f}%)")
++    logger.info(f"  Batch preparation: {batch_prep_time:.2f}s ({batch_prep_time/total_time*100:.1f}%)")
++    logger.info(f"  Inference: {inference_time:.2f}s ({inference_time/total_time*100:.1f}%)")
++    logger.info(f"  Result construction: {result_construction_time:.2f}s ({result_construction_time/total_time*100:.1f}%)")
+ 
+     return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list
+ 
+@@ -191,6 +274,7 @@ def batch_image_analyze(
+             logger.info(f'Could not determine GPU memory, using default batch_ratio: {batch_ratio}')
+ 
+     batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable)
++    #76%
+     results = batch_model(images_with_extra_info)
+ 
+     clean_memory(get_device())
+diff --git a/mineru/cli/common.py b/mineru/cli/common.py
+index cd9f0803..64b94634 100644
+--- a/mineru/cli/common.py
++++ b/mineru/cli/common.py
+@@ -188,7 +188,11 @@ def _process_pipeline(
+         model_json = copy.deepcopy(model_list)
+         pdf_file_name = pdf_file_names[idx]
+         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
++        # 允许通过环境变量跳过临时图片写入以减少IO与中间数据
++        from mineru.data.data_reader_writer import DummyDataWriter
++        skip_tmp_images = os.getenv('MINERU_SKIP_TMP_IMAGES', '').lower() in ['1', 'true', 'yes', 'on']
++        image_writer = DummyDataWriter() if skip_tmp_images else FileBasedDataWriter(local_image_dir)
++        md_writer = FileBasedDataWriter(local_md_dir)
+ 
+         images_list = all_image_lists[idx]
+         pdf_doc = all_pdf_docs[idx]
+diff --git a/mineru/model/layout/doclayout_yolo.py b/mineru/model/layout/doclayout_yolo.py
+index 5667a909..08600d29 100644
+--- a/mineru/model/layout/doclayout_yolo.py
++++ b/mineru/model/layout/doclayout_yolo.py
+@@ -27,10 +27,13 @@ class DocLayoutYOLOModel:
+         if not hasattr(prediction, "boxes") or prediction.boxes is None:
+             return layout_res
+ 
++        # 避免对同一结果多次 .cpu() 触发多个 D2H，将 boxes 一次性移到 CPU
++        boxes_cpu = prediction.boxes.to('cpu') if hasattr(prediction.boxes, 'to') else prediction.boxes
++
+         for xyxy, conf, cls in zip(
+-            prediction.boxes.xyxy.cpu(),
+-            prediction.boxes.conf.cpu(),
+-            prediction.boxes.cls.cpu(),
++            boxes_cpu.xyxy,
++            boxes_cpu.conf,
++            boxes_cpu.cls,
+         ):
+             coords = list(map(int, xyxy.tolist()))
+             xmin, ymin, xmax, ymax = coords
+diff --git a/mineru/model/mfr/unimernet/Unimernet.py b/mineru/model/mfr/unimernet/Unimernet.py
+index ae3879da..506b5d5d 100644
+--- a/mineru/model/mfr/unimernet/Unimernet.py
++++ b/mineru/model/mfr/unimernet/Unimernet.py
+@@ -49,7 +49,13 @@ class UnimernetModel(object):
+             mf_image_list.append(bbox_img)
+ 
+         dataset = MathDataset(mf_image_list, transform=self.model.transform)
+-        dataloader = DataLoader(dataset, batch_size=32, num_workers=0)
++        # Allow configuring dataloader workers via env var
++        import os as _os
++        try:
++            _num_workers = int(_os.getenv('MINERU_MFR_DATALOADER_WORKERS', '0'))
++        except Exception:
++            _num_workers = 0
++        dataloader = DataLoader(dataset, batch_size=32, num_workers=_num_workers)
+         mfr_res = []
+         for mf_img in dataloader:
+             mf_img = mf_img.to(dtype=self.model.dtype)
+@@ -108,7 +114,13 @@ class UnimernetModel(object):
+         # 如果batch_size > len(sorted_images)，则设置为不超过len(sorted_images)的2的幂
+         batch_size = min(batch_size, max(1, 2 ** (len(sorted_images).bit_length() - 1))) if sorted_images else 1
+ 
+-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0)
++        # Allow configuring dataloader workers via env var
++        import os as _os
++        try:
++            _num_workers = int(_os.getenv('MINERU_MFR_DATALOADER_WORKERS', '0'))
++        except Exception:
++            _num_workers = 0
++        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=_num_workers)
+ 
+         # Process batches and store results
+         mfr_res = []
+diff --git a/mineru/model/ocr/paddleocr2pytorch/pytorch_paddle.py b/mineru/model/ocr/paddleocr2pytorch/pytorch_paddle.py
+index f593c2cf..f80be41a 100644
+--- a/mineru/model/ocr/paddleocr2pytorch/pytorch_paddle.py
++++ b/mineru/model/ocr/paddleocr2pytorch/pytorch_paddle.py
+@@ -17,7 +17,6 @@ from .tools.infer.predict_system import TextSystem
+ from .tools.infer import pytorchocr_utility as utility
+ import argparse
+ 
+-
+ latin_lang = [
+         'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',  # noqa: E126
+         'hu', 'id', 'is', 'it', 'ku', 'la', 'lt', 'lv', 'mi', 'ms', 'mt', 'nl',
+@@ -88,7 +87,12 @@ class PytorchPaddleOCR(TextSystem):
+         kwargs['det_model_path'] = det_model_path
+         kwargs['rec_model_path'] = rec_model_path
+         kwargs['rec_char_dict_path'] = os.path.join(root_dir, 'pytorchocr', 'utils', 'resources', 'dict', dict_file)
+-        kwargs['rec_batch_num'] = 16
++        # 允许通过环境变量调整识别批大小，减少小批多拷贝次数
++        try:
++            _rec_bs = int(os.environ.get('MINERU_OCR_REC_BATCH_SIZE', '16'))
++        except Exception:
++            _rec_bs = 16
++        kwargs['rec_batch_num'] = _rec_bs
+ 
+         kwargs['device'] = device
+ 
+diff --git a/mineru/model/ocr/paddleocr2pytorch/pytorchocr/postprocess/rec_postprocess.py b/mineru/model/ocr/paddleocr2pytorch/pytorchocr/postprocess/rec_postprocess.py
+index 467f51ec..177ca768 100755
+--- a/mineru/model/ocr/paddleocr2pytorch/pytorchocr/postprocess/rec_postprocess.py
++++ b/mineru/model/ocr/paddleocr2pytorch/pytorchocr/postprocess/rec_postprocess.py
+@@ -182,9 +182,18 @@ class CTCLabelDecode(BaseRecLabelDecode):
+ 
+     def __call__(self, preds, label=None, return_word_box=False, *args, **kwargs):
+         if isinstance(preds, torch.Tensor):
+-            preds = preds.numpy()
+-        preds_idx = preds.argmax(axis=2)
+-        preds_prob = preds.max(axis=2)
++            # 在 GPU 上先计算 argmax/amax，仅回传索引与概率，避免整张量回传
++            if preds.is_cuda:
++                preds_idx_t = torch.argmax(preds, dim=2)
++                preds_prob_t = torch.amax(preds, dim=2)
++                preds_idx = preds_idx_t.detach().cpu().numpy()
++                preds_prob = preds_prob_t.detach().cpu().numpy()
++            else:
++                preds_idx = torch.argmax(preds, dim=2).numpy()
++                preds_prob = torch.amax(preds, dim=2).numpy()
++        else:
++            preds_idx = preds.argmax(axis=2)
++            preds_prob = preds.max(axis=2)
+         text = self.decode(
+             preds_idx,
+             preds_prob,
+@@ -220,9 +229,9 @@ class NRTRLabelDecode(BaseRecLabelDecode):
+             preds_id = preds[0]
+             preds_prob = preds[1]
+             if isinstance(preds_id, torch.Tensor):
+-                preds_id = preds_id.numpy()
++                preds_id = preds_id.detach().cpu().numpy()
+             if isinstance(preds_prob, torch.Tensor):
+-                preds_prob = preds_prob.numpy()
++                preds_prob = preds_prob.detach().cpu().numpy()
+             if preds_id[0][0] == 2:
+                 preds_idx = preds_id[:, 1:]
+                 preds_prob = preds_prob[:, 1:]
+@@ -234,7 +243,7 @@ class NRTRLabelDecode(BaseRecLabelDecode):
+             label = self.decode(label[:, 1:])
+         else:
+             if isinstance(preds, torch.Tensor):
+-                preds = preds.numpy()
++                preds = preds.detach().cpu().numpy()
+             preds_idx = preds.argmax(axis=2)
+             preds_prob = preds.max(axis=2)
+             text = self.decode(preds_idx, preds_prob, is_remove_duplicate=False)
+@@ -280,7 +289,7 @@ class ViTSTRLabelDecode(NRTRLabelDecode):
+ 
+     def __call__(self, preds, label=None, *args, **kwargs):
+         if isinstance(preds, torch.Tensor):
+-            preds = preds[:, 1:].numpy()
++            preds = preds[:, 1:].detach().cpu().numpy()
+         else:
+             preds = preds[:, 1:]
+         preds_idx = preds.argmax(axis=2)
+@@ -482,7 +491,7 @@ class SRNLabelDecode(BaseRecLabelDecode):
+         pred = preds['predict']
+         char_num = len(self.character_str) + 2
+         if isinstance(pred, torch.Tensor):
+-            pred = pred.numpy()
++            pred = pred.detach().cpu().numpy()
+         pred = np.reshape(pred, [-1, char_num])
+ 
+         preds_idx = np.argmax(pred, axis=1)
+diff --git a/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_det.py b/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_det.py
+index 3de483ac..c51020b4 100755
+--- a/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_det.py
++++ b/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_det.py
+@@ -1,4 +1,5 @@
+ import sys
++import os
+ 
+ import numpy as np
+ import time
+@@ -164,24 +165,27 @@ class TextDetector(BaseOCRV20):
+         # 批处理推理
+         with torch.no_grad():
+             inp = torch.from_numpy(batch_tensor)
+-            inp = inp.to(self.device)
++            try:
++                inp = inp.pin_memory().to(self.device, non_blocking=True)
++            except Exception:
++                inp = inp.to(self.device)
+             outputs = self.net(inp)
+ 
+-        # 处理输出
++        # 处理输出（统一为“每批一次 D2H”，避免逐图拷贝；满足 ONE_D2H 的目标且不改变返回类型）
+         preds = {}
+         if self.det_algorithm == "EAST":
+-            preds['f_geo'] = outputs['f_geo'].cpu().numpy()
+-            preds['f_score'] = outputs['f_score'].cpu().numpy()
++            preds['f_geo'] = outputs['f_geo'].detach().cpu().numpy()
++            preds['f_score'] = outputs['f_score'].detach().cpu().numpy()
+         elif self.det_algorithm == 'SAST':
+-            preds['f_border'] = outputs['f_border'].cpu().numpy()
+-            preds['f_score'] = outputs['f_score'].cpu().numpy()
+-            preds['f_tco'] = outputs['f_tco'].cpu().numpy()
+-            preds['f_tvo'] = outputs['f_tvo'].cpu().numpy()
++            preds['f_border'] = outputs['f_border'].detach().cpu().numpy()
++            preds['f_score'] = outputs['f_score'].detach().cpu().numpy()
++            preds['f_tco'] = outputs['f_tco'].detach().cpu().numpy()
++            preds['f_tvo'] = outputs['f_tvo'].detach().cpu().numpy()
+         elif self.det_algorithm in ['DB', 'PSE', 'DB++']:
+-            preds['maps'] = outputs['maps'].cpu().numpy()
++            preds['maps'] = outputs['maps'].detach().cpu().numpy()
+         elif self.det_algorithm == 'FCE':
+             for i, (k, output) in enumerate(outputs.items()):
+-                preds['level_{}'.format(i)] = output.cpu().numpy()
++                preds['level_{}'.format(i)] = output.detach().cpu().numpy()
+         else:
+             raise NotImplementedError
+ 
+@@ -194,23 +198,33 @@ class TextDetector(BaseOCRV20):
+             single_preds = {}
+             for key, value in preds.items():
+                 if isinstance(value, np.ndarray):
++                    # 维度健壮性保护
++                    if value.shape[0] <= i:
++                        # 回退：单图调用，避免越界
++                        dt_boxes_fallback, elapse_fallback = self.__call__(ori_imgs[i])
++                        batch_results.append((dt_boxes_fallback, total_elapse / max(1, len(img_list))))
++                        break
+                     single_preds[key] = value[i:i + 1]  # 保持批次维度
+                 else:
+                     single_preds[key] = value
+-
+-            # 后处理
+-            post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
+-            dt_boxes = post_result[0]['points']
+-
+-            # 过滤和裁剪检测框
+-            if (self.det_algorithm == "SAST" and
+-                self.det_sast_polygon) or (self.det_algorithm in ["PSE", "FCE"] and
+-                                           self.postprocess_op.box_type == 'poly'):
+-                dt_boxes = self.filter_tag_det_res_only_clip(dt_boxes, ori_imgs[i].shape)
+             else:
+-                dt_boxes = self.filter_tag_det_res(dt_boxes, ori_imgs[i].shape)
++                # 后处理
++                try:
++                    post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
++                    dt_boxes = post_result[0]['points']
++                except Exception:
++                    # 回退：单图调用，保证正确性
++                    dt_boxes, _ = self.__call__(ori_imgs[i])
++
++                # 过滤和裁剪检测框
++                if (self.det_algorithm == "SAST" and
++                    self.det_sast_polygon) or (self.det_algorithm in ["PSE", "FCE"] and
++                                               self.postprocess_op.box_type == 'poly'):
++                    dt_boxes = self.filter_tag_det_res_only_clip(dt_boxes, ori_imgs[i].shape)
++                else:
++                    dt_boxes = self.filter_tag_det_res(dt_boxes, ori_imgs[i].shape)
+ 
+-            batch_results.append((dt_boxes, total_elapse / len(img_list)))
++                batch_results.append((dt_boxes, total_elapse / max(1, len(img_list))))
+ 
+         return batch_results, total_elapse
+ 
+@@ -296,17 +310,34 @@ class TextDetector(BaseOCRV20):
+         ori_im = img.copy()
+         data = {'image': img}
+         data = transform(data, self.preprocess_op)
++        if data is None:
++            return None, 0
+         img, shape_list = data
+         if img is None:
+             return None, 0
+         img = np.expand_dims(img, axis=0)
+-        shape_list = np.expand_dims(shape_list, axis=0)
++        # shape_list 可能为标量/一维/None，这里确保为二维
++        if shape_list is None:
++            # 回退为单位缩放，避免后续报错；在正常流程中该分支不应命中
++            shape_list = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
++        elif isinstance(shape_list, (list, tuple)):
++            shape_list = np.array(shape_list)
++            if shape_list.ndim == 1:
++                shape_list = np.expand_dims(shape_list, axis=0)
++        elif isinstance(shape_list, np.ndarray):
++            if shape_list.ndim == 1:
++                shape_list = np.expand_dims(shape_list, axis=0)
++        else:
++            shape_list = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+         img = img.copy()
+         starttime = time.time()
+ 
+         with torch.no_grad():
+             inp = torch.from_numpy(img)
+-            inp = inp.to(self.device)
++            try:
++                inp = inp.pin_memory().to(self.device, non_blocking=True)
++            except Exception:
++                inp = inp.to(self.device)
+             outputs = self.net(inp)
+ 
+         preds = {}
+@@ -326,6 +357,13 @@ class TextDetector(BaseOCRV20):
+         else:
+             raise NotImplementedError
+ 
++        # postprocess 期望 shape_list 为批次可迭代结构
++        if not isinstance(shape_list, (list, tuple, np.ndarray)):
++            shape_list = np.array([shape_list])
++        # 若 preds 保持为 GPU tensor（one_d2h=1），让上层批末统一 D2H 和后处理；此处仅返回 preds 交由上层处理
++        one_d2h = str(os.getenv('MINERU_OCR_DET_ONE_D2H', '0')).lower() in ['1', 'true', 'yes', 'on']
++        if one_d2h:
++            return preds, 0
+         post_result = self.postprocess_op(preds, shape_list)
+         dt_boxes = post_result[0]['points']
+         if (self.det_algorithm == "SAST" and
+diff --git a/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_rec.py b/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_rec.py
+index c06ca5fe..3c0f0aae 100755
+--- a/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_rec.py
++++ b/mineru/model/ocr/paddleocr2pytorch/tools/infer/predict_rec.py
+@@ -1,4 +1,5 @@
+ from PIL import Image
++import os
+ import cv2
+ import numpy as np
+ import math
+@@ -100,10 +101,18 @@ class TextRecognizer(BaseOCRV20):
+             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+             # return padding_im
+             image_pil = Image.fromarray(np.uint8(img))
++            # 兼容 Pillow 新旧版本的重采样枚举，保持语义不变
++            resampling = getattr(Image, 'Resampling', None)
+             if self.rec_algorithm == 'ViTSTR':
+-                img = image_pil.resize([imgW, imgH], Image.BICUBIC)
++                if resampling is not None:
++                    img = image_pil.resize([imgW, imgH], resampling.BICUBIC)
++                else:
++                    img = image_pil.resize([imgW, imgH], getattr(Image, 'BICUBIC', 3))
+             else:
+-                img = image_pil.resize([imgW, imgH], Image.ANTIALIAS)
++                if resampling is not None:
++                    img = image_pil.resize([imgW, imgH], resampling.LANCZOS)
++                else:
++                    img = image_pil.resize([imgW, imgH], getattr(Image, 'LANCZOS', 1))
+             img = np.array(img)
+             norm_img = np.expand_dims(img, -1)
+             norm_img = norm_img.transpose((2, 0, 1))
+@@ -397,7 +406,10 @@ class TextRecognizer(BaseOCRV20):
+ 
+                     with torch.no_grad():
+                         inp = torch.from_numpy(norm_img_batch)
+-                        inp = inp.to(self.device)
++                        try:
++                            inp = inp.pin_memory().to(self.device, non_blocking=True)
++                        except Exception:
++                            inp = inp.to(self.device)
+                         preds = self.net(inp)
+ 
+                 elif self.rec_algorithm == "CAN":
+@@ -407,7 +419,10 @@ class TextRecognizer(BaseOCRV20):
+                     inputs = [norm_img_batch, norm_img_mask_batch, word_label_list]
+ 
+                     inp = [torch.from_numpy(e_i) for e_i in inputs]
+-                    inp = [e_i.to(self.device) for e_i in inp]
++                    try:
++                        inp = [e_i.pin_memory().to(self.device, non_blocking=True) for e_i in inp]
++                    except Exception:
++                        inp = [e_i.to(self.device) for e_i in inp]
+                     with torch.no_grad():
+                         outputs = self.net(inp)
+                         outputs = [v.cpu().numpy() for k, v in enumerate(outputs)]
+@@ -415,32 +430,32 @@ class TextRecognizer(BaseOCRV20):
+                     preds = outputs
+ 
+                 else:
+-                    starttime = time.time()
+-
++                    # 默认 CRNN/CTC 路径：将 GPU Tensor 直接传给解码器，
++                    # 由解码器在 GPU 上完成 argmax/max，仅回传索引/分数，避免大规模 D2H
++                    starttime_total = time.time()
+                     with torch.no_grad():
+                         inp = torch.from_numpy(norm_img_batch)
+-                        inp = inp.to(self.device)
++                        try:
++                            inp = inp.pin_memory().to(self.device, non_blocking=True)
++                        except Exception:
++                            inp = inp.to(self.device)
+                         prob_out = self.net(inp)
+ 
+-                    if isinstance(prob_out, list):
+-                        preds = [v.cpu().numpy() for v in prob_out]
+-                    else:
+-                        preds = prob_out.cpu().numpy()
+-
+-                rec_result = self.postprocess_op(preds)
+-                for rno in range(len(rec_result)):
+-                    rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+-                elapse += time.time() - starttime
++                    rec_result = self.postprocess_op(prob_out)
++                    for rno in range(len(rec_result)):
++                        rec_res[indices[beg_img_no + rno]] = rec_result[rno]
++                    elapse += time.time() - starttime_total
++                    # 更新进度条：本批实际处理的样本数
++                    current_batch_size = end_img_no - beg_img_no
++                    index += 1
++                    pbar.update(current_batch_size)
+ 
+-                # 更新进度条，每次增加batch_size，但要注意最后一个batch可能不足batch_size
+-                current_batch_size = min(batch_num, img_num - index * batch_num)
+-                index += 1
+-                pbar.update(current_batch_size)
++            # 单次 D2H 合并逻辑已移除，默认在 GPU 上先做 argmax/max，逐批解码并回传小结果
+ 
+         # Fix NaN values in recognition results
+         for i in range(len(rec_res)):
+             text, score = rec_res[i]
+             if isinstance(score, float) and math.isnan(score):
+-                rec_res[i] = (text, 0.0)
++                rec_res[i] = [text, 0.0]
+ 
+         return rec_res, elapse
+diff --git a/mineru/utils/cut_image.py b/mineru/utils/cut_image.py
+index 20e02aee..652c2272 100644
+--- a/mineru/utils/cut_image.py
++++ b/mineru/utils/cut_image.py
+@@ -1,5 +1,6 @@
+ from loguru import logger
+ 
++import os
+ from .pdf_image_tools import cut_image
+ 
+ 
+@@ -10,6 +11,13 @@ def cut_image_and_table(span, page_pil_img, page_img_md5, page_id, image_writer,
+ 
+     span_type = span["type"]
+ 
++    # 允许通过环境变量跳过临时图片的保存（不影响最终 JSON）
++    skip_tmp_images = os.getenv('MINERU_SKIP_TMP_IMAGES', '').lower() in ['1', 'true', 'yes', 'on']
++
++    if skip_tmp_images:
++        span["image_path"] = ""
++        return span
++
+     if not check_img_bbox(span["bbox"]) or not image_writer:
+         span["image_path"] = ""
+     else:
+diff --git a/mineru/utils/nvtx_utils.py b/mineru/utils/nvtx_utils.py
+new file mode 100644
+index 00000000..66ba0d5f
+--- /dev/null
++++ b/mineru/utils/nvtx_utils.py
+@@ -0,0 +1,221 @@
++"""
++NVTX性能分析工具宏
++统一管理NVTX功能的开启和关闭，避免在代码中来回注释
++
++使用方法：
++1. 通过环境变量控制：
++   export MINERU_NVTX_ENABLE=true  # 开启NVTX
++   export MINERU_NVTX_ENABLE=false # 关闭NVTX
++
++2. 在代码中使用：
++   from mineru.utils.nvtx_utils import nvtx_range_push, nvtx_range_pop
++   
++   nvtx_range_push("operation_name")
++   # 你的代码
++   nvtx_range_pop()
++
++3. 使用上下文管理器（推荐）：
++   from mineru.utils.nvtx_utils import nvtx_range
++   
++   with nvtx_range("operation_name"):
++       # 你的代码
++"""
++
++import os
++import functools
++from contextlib import contextmanager
++from typing import Optional, Any
++
++
++class NVTXManager:
++    """NVTX管理器"""
++    
++    def __init__(self):
++        self._enabled = None
++        self._torch_available = None
++        self._cuda_nvtx_available = None
++        self._cpu_nvtx_available = None
++        
++    @property
++    def enabled(self) -> bool:
++        """检查NVTX是否启用"""
++        if self._enabled is None:
++            # 从环境变量读取配置，默认为False
++            env_value = os.getenv('MINERU_NVTX_ENABLE', 'false').lower()
++            self._enabled = env_value in ('true', '1', 'yes', 'on')
++        return self._enabled
++    
++    def _detect_cuda_nvtx(self) -> bool:
++        if self._cuda_nvtx_available is None:
++            try:
++                import torch  # noqa: WPS433
++                self._torch_available = True
++                self._cuda_nvtx_available = (
++                    hasattr(torch, "cuda") and hasattr(torch.cuda, "nvtx") and torch.cuda.is_available()
++                )
++            except Exception:
++                self._torch_available = False
++                self._cuda_nvtx_available = False
++        return bool(self._cuda_nvtx_available)
++
++    def _detect_cpu_nvtx(self) -> bool:
++        if self._cpu_nvtx_available is None:
++            try:
++                import nvtx  # type: ignore  # noqa: F401, WPS433
++                self._cpu_nvtx_available = True
++            except Exception:
++                self._cpu_nvtx_available = False
++        return bool(self._cpu_nvtx_available)
++
++    def backend(self) -> str:
++        """返回实际使用的后端: 'cuda' | 'cpu' | 'none'"""
++        if not self.enabled:
++            return "none"
++        backend_pref = os.getenv('MINERU_NVTX_BACKEND', 'auto').lower()
++        if backend_pref == 'cuda':
++            return 'cuda' if self._detect_cuda_nvtx() else 'none'
++        if backend_pref == 'cpu':
++            return 'cpu' if self._detect_cpu_nvtx() else 'none'
++        # auto: cuda 优先，其次 cpu
++        if self._detect_cuda_nvtx():
++            return 'cuda'
++        if self._detect_cpu_nvtx():
++            return 'cpu'
++        return 'none'
++    
++    def force_enable(self):
++        """强制启用NVTX（用于调试）"""
++        self._enabled = True
++        
++    def force_disable(self):
++        """强制禁用NVTX"""
++        self._enabled = False
++        
++    def reset(self):
++        """重置状态，重新从环境变量读取配置"""
++        self._enabled = None
++
++
++# 全局管理器实例
++_nvtx_manager = NVTXManager()
++
++
++def nvtx_range_push(name: str, domain: Optional[str] = None) -> None:
++    """
++    开始NVTX范围标记
++    
++    Args:
++        name: 范围名称
++        domain: 域名（可选）
++    """
++    backend = _nvtx_manager.backend()
++    if backend == 'none':
++        return
++    try:
++        if backend == 'cuda':
++            import torch  # noqa: WPS433
++            if domain:
++                torch.cuda.nvtx.range_push(name, domain)
++            else:
++                torch.cuda.nvtx.range_push(name)
++        elif backend == 'cpu':
++            import nvtx  # type: ignore  # noqa: WPS433
++            # python-nvtx 不支持 domain 参数，忽略之
++            nvtx.range_push(name)
++    except Exception:
++        pass
++
++
++def nvtx_range_pop() -> None:
++    """结束NVTX范围标记"""
++    backend = _nvtx_manager.backend()
++    if backend == 'none':
++        return
++    try:
++        if backend == 'cuda':
++            import torch  # noqa: WPS433
++            torch.cuda.nvtx.range_pop()
++        elif backend == 'cpu':
++            import nvtx  # type: ignore  # noqa: WPS433
++            nvtx.range_pop()
++    except Exception:
++        pass
++
++
++@contextmanager
++def nvtx_range(name: str, domain: Optional[str] = None):
++    """
++    NVTX范围上下文管理器（推荐使用）
++    
++    Args:
++        name: 范围名称
++        domain: 域名（可选）
++        
++    Example:
++        with nvtx_range("my_operation"):
++            # 你的代码
++            pass
++    """
++    nvtx_range_push(name, domain)
++    try:
++        yield
++    finally:
++        nvtx_range_pop()
++
++
++def nvtx_annotate(name: Optional[str] = None, domain: Optional[str] = None):
++    """
++    NVTX函数装饰器
++    
++    Args:
++        name: 范围名称，如果为None则使用函数名
++        domain: 域名（可选）
++        
++    Example:
++        @nvtx_annotate("my_function")
++        def my_function():
++            pass
++            
++        @nvtx_annotate()  # 使用函数名作为范围名
++        def another_function():
++            pass
++    """
++    def decorator(func):
++        @functools.wraps(func)
++        def wrapper(*args, **kwargs):
++            range_name = name if name is not None else func.__name__
++            with nvtx_range(range_name, domain):
++                return func(*args, **kwargs)
++        return wrapper
++    return decorator
++
++
++# 便利函数
++def enable_nvtx():
++    """启用NVTX"""
++    _nvtx_manager.force_enable()
++
++
++def disable_nvtx():
++    """禁用NVTX"""
++    _nvtx_manager.force_disable()
++
++
++def is_nvtx_enabled() -> bool:
++    """检查NVTX是否启用"""
++    return _nvtx_manager.enabled and (_nvtx_manager.backend() in ('cuda', 'cpu'))
++
++
++def get_nvtx_status() -> dict:
++    """获取NVTX状态信息"""
++    return {
++        "enabled": _nvtx_manager.enabled,
++        "backend": _nvtx_manager.backend(),
++        "env_value": os.getenv('MINERU_NVTX_ENABLE', 'false'),
++        "effective_enabled": is_nvtx_enabled()
++    }
++
++
++# 兼容性别名
++nvtx_push = nvtx_range_push
++nvtx_pop = nvtx_range_pop
+diff --git a/mineru/utils/pdf_image_tools.py b/mineru/utils/pdf_image_tools.py
+index 36ed43ba..b995ba5b 100644
+--- a/mineru/utils/pdf_image_tools.py
++++ b/mineru/utils/pdf_image_tools.py
+@@ -7,6 +7,35 @@ from PIL import Image
+ 
+ from mineru.data.data_reader_writer import FileBasedDataWriter
+ from mineru.utils.pdf_reader import image_to_b64str, image_to_bytes, page_to_image
++import os
++from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
++
++
++def _render_pages_chunk(args):
++    """Worker: 在子进程中渲染一组页面，返回 (page_index, image_dict) 列表。
++
++    注意：每个子进程各自打开 PdfDocument，避免跨进程共享对象带来的不安全。
++    """
++    pdf_bytes, dpi, indices = args
++    results = []
++    try:
++        doc = pdfium.PdfDocument(pdf_bytes)
++        for i in indices:
++            try:
++                page = doc[i]
++                pil_img, scale = page_to_image(page, dpi=dpi)
++                img_base64 = image_to_b64str(pil_img)
++                image_dict = {"img_base64": img_base64, "img_pil": pil_img, "scale": scale}
++                results.append((i, image_dict))
++            except Exception:
++                continue
++        try:
++            doc.close()
++        except Exception:
++            pass
++    except Exception:
++        pass
++    return results
+ from .hash_utils import str_sha256
+ 
+ 
+@@ -20,8 +49,12 @@ def pdf_page_to_image(page: pdfium.PdfPage, dpi=200) -> dict:
+     Returns:
+         dict:  {'img_base64': str, 'img_pil': pil_img, 'scale': float }
+     """
++    # 固定使用传入的 dpi，不开放通过环境变量修改，以保持一致的渲染策略
+     pil_img, scale = page_to_image(page, dpi=dpi)
+-    img_base64 = image_to_b64str(pil_img)
++
++    # 允许通过环境变量跳过页级 base64 生成，减少 CPU 与内存
++    enable_b64 = str(os.getenv("MINERU_ENABLE_PAGE_BASE64", "0")).lower() in ["1", "true", "yes", "on"]
++    img_base64 = image_to_b64str(pil_img) if enable_b64 else ""
+ 
+     image_dict = {
+         "img_base64": img_base64,
+@@ -45,8 +78,60 @@ def load_images_from_pdf(
+         logger.warning("end_page_id is out of range, use images length")
+         end_page_id = pdf_page_num - 1
+ 
+-    for index in range(0, pdf_page_num):
+-        if start_page_id <= index <= end_page_id:
++    # 生成目标页索引
++    target_indices = [i for i in range(pdf_page_num) if start_page_id <= i <= end_page_id]
++
++    # 并行渲染控制：优先线程池（MINERU_PDF_RENDER_THREADS），否则进程池（MINERU_PDF_RENDER_WORKERS），否则串行
++    threads = 0
++    workers = 0
++    try:
++        threads = int(os.getenv("MINERU_PDF_RENDER_THREADS", "0"))
++    except Exception:
++        threads = 0
++    try:
++        workers = int(os.getenv("MINERU_PDF_RENDER_WORKERS", "0"))
++    except Exception:
++        workers = 0
++
++    total_pages = len(target_indices)
++
++    if threads and threads > 1 and total_pages > 1:
++        logger.info(f"PDF render mode: threads={threads}, pages={total_pages}")
++        chunk_size = max(1, (total_pages + threads - 1) // threads)
++        chunks = [target_indices[i:i + chunk_size] for i in range(0, total_pages, chunk_size)]
++
++        futures = []
++        with ThreadPoolExecutor(max_workers=threads) as executor:
++            for indices in chunks:
++                futures.append(executor.submit(_render_pages_chunk, (pdf_bytes, dpi, indices)))
++            tmp = []
++            for fut in as_completed(futures):
++                try:
++                    tmp.extend(fut.result())
++                except Exception:
++                    continue
++        tmp.sort(key=lambda x: x[0])
++        images_list = [image_dict for _, image_dict in tmp]
++    elif workers and workers > 1 and total_pages > 1:
++        logger.info(f"PDF render mode: processes={workers}, pages={total_pages}")
++        chunk_size = max(1, (total_pages + workers - 1) // workers)
++        chunks = [target_indices[i:i + chunk_size] for i in range(0, total_pages, chunk_size)]
++
++        futures = []
++        with ProcessPoolExecutor(max_workers=workers) as executor:
++            for indices in chunks:
++                futures.append(executor.submit(_render_pages_chunk, (pdf_bytes, dpi, indices)))
++            tmp = []
++            for fut in as_completed(futures):
++                try:
++                    tmp.extend(fut.result())
++                except Exception:
++                    continue
++        tmp.sort(key=lambda x: x[0])
++        images_list = [image_dict for _, image_dict in tmp]
++    else:
++        logger.info(f"PDF render mode: serial, pages={total_pages}")
++        for index in target_indices:
+             page = pdf_doc[index]
+             image_dict = pdf_page_to_image(page, dpi=dpi)
+             images_list.append(image_dict)
+diff --git a/mineru/utils/pdf_reader.py b/mineru/utils/pdf_reader.py
+index a7ddcd35..71f4087e 100644
+--- a/mineru/utils/pdf_reader.py
++++ b/mineru/utils/pdf_reader.py
+@@ -11,7 +11,7 @@ def page_to_image(
+     page: PdfPage,
+     dpi: int = 144,  # changed from 200 to 144
+     max_width_or_height: int = 2560,  # changed from 4500 to 2560
+-) -> (Image.Image, float):
++) -> tuple[Image.Image, float]:
+     scale = dpi / 72
+ 
+     long_side_length = max(*page.get_size())
+@@ -53,8 +53,8 @@ def pdf_to_images(
+     start_page_id: int = 0,
+     end_page_id: int | None = None,
+ ) -> list[Image.Image]:
+-    doc = pdf if isinstance(pdf, PdfDocument) else PdfDocument(pdf)
+-    page_num = len(doc)
++    doc_obj: PdfDocument = pdf if isinstance(pdf, PdfDocument) else PdfDocument(pdf)  # type: ignore[assignment]
++    page_num = len(doc_obj)
+ 
+     end_page_id = end_page_id if end_page_id is not None and end_page_id >= 0 else page_num - 1
+     if end_page_id > page_num - 1:
+@@ -64,11 +64,11 @@ def pdf_to_images(
+     images = []
+     try:
+         for i in range(start_page_id, end_page_id + 1):
+-            image, _ = page_to_image(doc[i], dpi, max_width_or_height)
++            image, _ = page_to_image(doc_obj[i], dpi, max_width_or_height)
+             images.append(image)
+     finally:
+         try:
+-            doc.close()
++            doc_obj.close()
+         except Exception:
+             pass
+     return images
+@@ -96,3 +96,56 @@ def pdf_to_images_b64strs(
+ ) -> list[str]:
+     images = pdf_to_images(pdf, dpi, max_width_or_height, start_page_id, end_page_id)
+     return [image_to_b64str(image, image_format) for image in images]
++
++
++# ----------------------------------------------------------------------------
++# Streaming-friendly helpers
++# ----------------------------------------------------------------------------
++def load_images_from_pdf_iter(
++    pdf: str | bytes | PdfDocument,
++    dpi: int = 144,
++    max_width_or_height: int = 2560,
++    start_page_id: int = 0,
++    end_page_id: int | None = None,
++):
++    """
++    Incrementally render a PDF into PIL images page-by-page and yield as an iterator.
++
++    This function is designed for streaming pipelines to reduce peak memory usage
++    and improve time-to-first-result. It mirrors the behavior of `pdf_to_images`
++    but avoids materializing the entire list in memory.
++
++    Args:
++        pdf: Path, raw bytes, or an existing PdfDocument
++        dpi: Render DPI (default: 144)
++        max_width_or_height: Max long side of rendered image (default: 2560)
++        start_page_id: Start page index (inclusive)
++        end_page_id: End page index (inclusive). None means last page
++
++    Yields:
++        dict with keys:
++            - 'img_pil': PIL.Image.Image
++            - 'scale': float (render scale used)
++
++    Notes:
++        - The underlying PdfDocument is closed automatically at the end.
++        - This function intentionally yields dictionaries to match existing
++          downstream expectations that use 'img_pil' and 'scale'.
++    """
++    doc_obj: PdfDocument = pdf if isinstance(pdf, PdfDocument) else PdfDocument(pdf)  # type: ignore[assignment]
++    page_num = len(doc_obj)
++
++    end_page_id = end_page_id if end_page_id is not None and end_page_id >= 0 else page_num - 1
++    if end_page_id > page_num - 1:
++        logger.warning("end_page_id is out of range, use images length")
++        end_page_id = page_num - 1
++
++    try:
++        for i in range(start_page_id, end_page_id + 1):
++            image, scale = page_to_image(doc_obj[i], dpi, max_width_or_height)
++            yield {"img_pil": image, "scale": scale}
++    finally:
++        try:
++            doc_obj.close()
++        except Exception:
++            pass

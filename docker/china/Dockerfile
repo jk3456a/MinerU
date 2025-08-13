@@ -22,7 +22,9 @@ RUN apt-get update && \
 # Copy local mineru project and install from source
 COPY . /app/
 WORKDIR /app
-RUN python3 -m pip install -U '.[core]' -i https://mirrors.aliyun.com/pypi/simple --break-system-packages && \
+RUN python3 -m pip install -U '.[core]' \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    --break-system-packages && \
     python3 -m pip cache purge
 
 # Download models and update the configuration file
