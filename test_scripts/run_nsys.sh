@@ -9,4 +9,4 @@ TIME_STAMP=$(date +%Y%m%d_%H%M%S)
     -t cuda,nvtx,osrt,cudnn,cublas \
     -s cpu \
     -o $OUTPUT_DIR/best_prectice_${TIME_STAMP} \
-    $PYTHON examples/best_prectice.py
+    $PYTHON examples/best_practice.py

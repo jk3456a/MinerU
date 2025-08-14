@@ -9,7 +9,7 @@ os.environ["MINERU_MODEL_SOURCE"] = "modelscope"  # 模型来源（如 modelscop
 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"  # 虚拟显存(GB)，用于估算批处理比例/显存策略
 os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"  # 最小批推理页数，增大提升吞吐但耗内存/显存
 
-os.environ["MINERU_SKIP_TMP_IMAGES"] = "0"  # 跳过中间表格的存储以减少I/O
+os.environ["MINERU_SKIP_TMP_IMAGES"] = "1"  # 跳过中间表格的存储以减少I/O
 
 # 优化的建议参数
 #####################################################
@@ -32,7 +32,7 @@ os.environ["MINERU_OCR_CROP_WORKERS"] = "20"  # OCR裁剪切图并发workers
 #####################################################
 
 # 调试用，目前不开启
-os.environ["MINERU_NVTX_ENABLE"] = "0"  # 启用NVTX标注，配合nsys做性能分析
+os.environ["MINERU_NVTX_ENABLE"] = "1"  # 启用NVTX标注，配合nsys做性能分析
 os.environ["MINERU_LOG_ENABLE"] = "1"  # 启用日志输出
 
 import json
@@ -140,10 +140,11 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
     image_writer = FileBasedDataWriter(local_image_dir)
 
     t3_1 = time.time()
-    middle_json = pipeline_result_to_middle_json(
-        model_list, images_list, pdf_doc, image_writer,
-        lang, _ocr_enable, formula_enable
-    )
+    with nvtxu.nvtx_range("processing.overall"):
+        middle_json = pipeline_result_to_middle_json(
+            model_list, images_list, pdf_doc, image_writer,
+            lang, _ocr_enable, formula_enable
+        )
     t4 = time.time()
     logger.info(f"Pipeline result to middle json spend: {t4 - t3_1:.2f}s")
     
@@ -168,9 +169,9 @@ def process_one_pdf_file(pdf_path, save_dir=None, lang="ch"):
     if not os.path.exists(f"{save_dir}/"):
         os.system(f"mkdir {save_dir}/")
     #
-    if os.path.exists(target_file):
-        print(f"the pdf result exist...[{target_file}]")
-        return
+    # if os.path.exists(target_file):
+    #     print(f"the pdf result exist...[{target_file}]")
+    #     return
 
     infer_result = infer_one_pdf(pdf_path, lang=lang)
     if infer_result is None:
@@ -204,15 +205,18 @@ def get_all_access_pdf_paths():
 
 def run_test_task():
     t0 = time.time()
-    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/input/sample_pdf_300/*pdf")  # 使用新的testinput文件夹
+    # pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/input/sample_pdf_300/*pdf")  # 使用新的testinput文件夹
+    # pdf_files = sorted(pdf_files)[:100]
+    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")
+    #只测试最后一篇pdf
+    pdf_files = pdf_files[-1:]
     # pdf_files = pdf_files[:1]
-    pdf_files = sorted(pdf_files)[:100]
     save_dir = "/cache/lizhen/repos/mineru/MinerU/output/best_practice"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"
     
     logger.info(f"Found {len(pdf_files)} documents to process")
-    logger.info(f"Input directory: /cache/lizhen/repos/MinerU/demo/testinput")
+    logger.info(f"Input directory: /cache/lizhen/repos/MinerU/demo/test_pdfs")
     logger.info(f"Output directory: {save_dir}")
     
     t1 = time.time()

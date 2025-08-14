@@ -153,12 +153,13 @@ def doc_analyze(
 
     # 准备批处理
     t3 = time.time()
-    images_with_extra_info = [(info[2], info[3], info[4]) for info in all_pages_info]
-    batch_size = min_batch_inference_size
-    batch_images = [
-        images_with_extra_info[i:i + batch_size]
-        for i in range(0, len(images_with_extra_info), batch_size)
-    ]
+    with nvtxu.nvtx_range("doc_analyze.batch_prepare"):
+        images_with_extra_info = [(info[2], info[3], info[4]) for info in all_pages_info]
+        batch_size = min_batch_inference_size
+        batch_images = [
+            images_with_extra_info[i:i + batch_size]
+            for i in range(0, len(images_with_extra_info), batch_size)
+        ]
     
     t4 = time.time()
     logger.info(f"Batch preparation completed: {t4 - t3:.2f}s")
@@ -170,19 +171,20 @@ def doc_analyze(
     processed_images_count = 0
     batch_times = []
     
-    for index, batch_image in enumerate(batch_images):
-        batch_start = time.time()
-        processed_images_count += len(batch_image)
-        logger.info(
-            f'Batch {index + 1}/{len(batch_images)}: '
-            f'{processed_images_count} pages/{len(images_with_extra_info)} pages'
-        )
-        batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
-        results.extend(batch_results)
-        batch_end = time.time()
-        batch_time = batch_end - batch_start
-        batch_times.append(batch_time)
-        logger.info(f'Batch {index + 1} completed in {batch_time:.2f}s')
+    with nvtxu.nvtx_range("doc_analyze.inference.overall"):
+        for index, batch_image in enumerate(batch_images):
+            batch_start = time.time()
+            processed_images_count += len(batch_image)
+            logger.info(
+                f'Batch {index + 1}/{len(batch_images)}: '
+                f'{processed_images_count} pages/{len(images_with_extra_info)} pages'
+            )
+            batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
+            results.extend(batch_results)
+            batch_end = time.time()
+            batch_time = batch_end - batch_start
+            batch_times.append(batch_time)
+            logger.info(f'Batch {index + 1} completed in {batch_time:.2f}s')
     
     t6 = time.time()
     total_inference_time = t6 - t5
@@ -193,19 +195,20 @@ def doc_analyze(
 
     # 构建返回结果
     t7 = time.time()
-    infer_results = []
-
-    for _ in range(len(pdf_bytes_list)):
-        infer_results.append([])
-
-    for i, page_info in enumerate(all_pages_info):
-        pdf_idx, page_idx, pil_img, _, _ = page_info
-        result = results[i]
-
-        page_info_dict = {'page_no': page_idx, 'width': pil_img.width, 'height': pil_img.height}
-        page_dict = {'layout_dets': result, 'page_info': page_info_dict}
-
-        infer_results[pdf_idx].append(page_dict)
+    with nvtxu.nvtx_range("doc_analyze.result_construction"):
+        infer_results = []
+        
+        for _ in range(len(pdf_bytes_list)):
+            infer_results.append([])
+        
+        for i, page_info in enumerate(all_pages_info):
+            pdf_idx, page_idx, pil_img, _, _ = page_info
+            result = results[i]
+        
+            page_info_dict = {'page_no': page_idx, 'width': pil_img.width, 'height': pil_img.height}
+            page_dict = {'layout_dets': result, 'page_info': page_info_dict}
+        
+            infer_results[pdf_idx].append(page_dict)
     
     t8 = time.time()
     logger.info(f"Result construction completed: {t8 - t7:.2f}s")
