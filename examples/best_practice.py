@@ -9,14 +9,14 @@ os.environ["MINERU_MODEL_SOURCE"] = "modelscope"  # 模型来源（如 modelscop
 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "24"  # 虚拟显存(GB)，用于估算批处理比例/显存策略
 os.environ["MINERU_MIN_BATCH_INFERENCE_SIZE"] = "768"  # 最小批推理页数，增大提升吞吐但耗内存/显存
 
-os.environ["MINERU_SKIP_TMP_IMAGES"] = "1"  # 跳过中间表格的存储以减少I/O
+os.environ["MINERU_SKIP_TMP_IMAGES"] = "0"  # 跳过中间表格的存储以减少I/O
 
 # 优化的建议参数
 #####################################################
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # CUDA内存分配策略，降低碎片化
 os.environ["MINERU_OCR_DET_MERGE_BUCKETS"] = "0"  # 文本检测是否合并buckets(0关/1开)
 os.environ["MINERU_OCR_DET_BATCH_SIZE"] = "128"  # 文本检测批大小，越大吞吐越高但显存更多
-os.environ["MINERU_OCR_DET_ONE_D2H"] = "1"  # 检测阶段合并一次性D2H拷贝，减少传输
+os.environ["MINERU_OCR_DET_ONE_D2H"] = "0"  # 检测阶段合并一次性D2H拷贝，减少传输
 os.environ["MINERU_OCR_REC_ONE_D2H"] = "1"  # 识别阶段合并一次性D2H拷贝，减少传输
 
 
@@ -32,9 +32,8 @@ os.environ["MINERU_OCR_CROP_WORKERS"] = "20"  # OCR裁剪切图并发workers
 #####################################################
 
 # 调试用，目前不开启
-os.environ["MINERU_NVTX_ENABLE"] = "1"  # 启用NVTX标注，配合nsys做性能分析
+os.environ["MINERU_NVTX_ENABLE"] = "0"  # 启用NVTX标注，配合nsys做性能分析
 os.environ["MINERU_LOG_ENABLE"] = "1"  # 启用日志输出
-
 import json
 
 import time
@@ -47,35 +46,14 @@ from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_j
 from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
 from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
 import mineru.utils.nvtx_utils as nvtxu
+from mineru.utils.logger_utils import get_logger, set_run_id
 
-# 添加日志配置
-from loguru import logger
 
 _LOG_ENABLE = os.environ.get("MINERU_LOG_ENABLE", "1") == "1"
 
-# 配置loguru日志格式
-logger.remove()  # 移除默认的处理器
-
-# 生成运行标识符
 run_id = str(uuid.uuid4())[:8]  # 取前8位作为运行ID
-
-if _LOG_ENABLE:
-    # 创建logs目录与添加日志输出
-    os.makedirs("logs", exist_ok=True)
-    logger.add(
-        "logs/best_prectice.log",  # 日志文件
-        format="\n{time:YYYY-MM-DD HH:mm:ss} | {level} | [{run_id}] {message}",
-        level="INFO",
-        rotation="10 MB",  # 日志文件大小超过10MB时轮转
-        retention="7 days",  # 保留7天的日志
-        filter=lambda record: record.update(run_id=run_id) or True
-    )
-    logger.add(
-        lambda msg: print(msg, end=""),  # 同时输出到控制台
-        format="{time:HH:mm:ss} | {level} | [{run_id}] {message}",
-        level="INFO",
-        filter=lambda record: record.update(run_id=run_id) or True
-    )
+set_run_id(run_id)
+logger = get_logger("best_practice", file_name="best_prectice.log")
 
 # 添加运行开始标识
 logger.info("=" * 80)
@@ -88,7 +66,6 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
     with open(pdf_file_path, 'rb') as fi:
         pdf_bytes = fi.read()
     t1 = time.time()
-    
     try:
         new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes)
         t2 = time.time()
@@ -102,7 +79,7 @@ def infer_one_pdf(pdf_file_path, lang="ch"):
             return None
     
     formula_enable = True
-    table_enable = False
+    table_enable = True
     pdf_name = os.path.basename(pdf_file_path)
     
     logger.info(f"Processing PDF: {pdf_name}")
@@ -207,10 +184,12 @@ def run_test_task():
     t0 = time.time()
     # pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/input/sample_pdf_300/*pdf")  # 使用新的testinput文件夹
     # pdf_files = sorted(pdf_files)[:100]
-    pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")
+    # pdf_files = glob.glob(f"/cache/lizhen/repos/MinerU/demo/test_pdfs/*pdf")
+    pdf_files = glob.glob(f"/cache/lizhen/repos/mineru/MinerU/testdata/qikan_pdf_sample/*pdf")
+    #测试少量文件
+    pdf_files = pdf_files[:75] 
     #只测试最后一篇pdf
-    pdf_files = pdf_files[-1:]
-    # pdf_files = pdf_files[:1]
+    # pdf_files = pdf_files[-1:]
     save_dir = "/cache/lizhen/repos/mineru/MinerU/output/best_practice"
     # pdf_files = glob.glob(f"/user/zhangxueren/sample_pdf_300/*pdf")
     # save_dir = "/user/zhangxueren/sample_pdf_res"
