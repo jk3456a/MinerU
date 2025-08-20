@@ -263,25 +263,6 @@ def run_test_task():
     logger.info(f"Successfully processed: {processed_count}/{len(pdf_files)} files")
     logger.info(f"Average time per document: {total_time/len(pdf_files):.2f}s" if pdf_files else "No documents processed")
 
-
-def main():
-    import glob
-    # pdf_files = glob.glob("/home/admin/zhangxueren/sample_pdf_300/*pdf")
-    # random.shuffle(pdf_files)
-    pdf_files = get_all_access_pdf_paths()
-    print(f"pdf_files cnt:{len(pdf_files)}")
-    for idx, file_path in enumerate(pdf_files):
-        if not os.path.exists(file_path):
-            continue
-
-        try:
-            process_one_pdf_file(file_path)
-        except Exception as e:
-            print(e)
-            traceback.print_stack()
-            print('=====' * 10)
-
-
 if __name__ == "__main__":
     t0 = time.time()
 
